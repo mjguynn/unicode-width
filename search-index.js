@@ -1,0 +1,4 @@
+var searchIndex = JSON.parse('{\
+"unicode_width":{"doc":"Determine displayed width of `char` and `str` types…","i":[[17,"UNICODE_VERSION","unicode_width","The version of Unicode that this version of unicode-width…",null,null],[8,"UnicodeWidthChar","","Methods for determining displayed width of Unicode…",null,null],[10,"width","","Returns the character\'s displayed width in columns, or…",0,[[],["option",4]]],[10,"width_cjk","","Returns the character\'s displayed width in columns, or…",0,[[],["option",4]]],[8,"UnicodeWidthStr","","Methods for determining displayed width of Unicode strings.",null,null],[10,"width","","Returns the string\'s displayed width in columns.",1,[[]]],[10,"width_cjk","","Returns the string\'s displayed width in columns.",1,[[]]]],"p":[[8,"UnicodeWidthChar"],[8,"UnicodeWidthStr"]]}\
+}');
+addSearchOptions(searchIndex);initSearch(searchIndex);
