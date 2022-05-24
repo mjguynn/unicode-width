@@ -56,12 +56,11 @@ extern crate std;
 #[cfg(feature = "bench")]
 extern crate test;
 
-use tables::charwidth as cw;
-pub use tables::UNICODE_VERSION;
+pub use generated::UNICODE_VERSION;
 
 use core::ops::Add;
 
-mod tables;
+mod generated;
 
 #[cfg(test)]
 mod tests;
@@ -87,12 +86,38 @@ pub trait UnicodeWidthChar {
     fn width_cjk(self) -> Option<usize>;
 }
 
+fn get_width<const CJK: bool>(c: char) -> usize {
+    let needle = (u32::from(c) << 4) | 0b1000;
+    let i = generated::CODEPOINT_PROPERTIES.binary_search(&needle).unwrap_err();
+    let width = generated::CODEPOINT_PROPERTIES[i-1] & 0b11;
+    if width == 3 {
+       return if CJK { 2 } else { 1 };
+    }
+    else {
+        return width as usize
+    }
+    
+}
+#[inline(always)]
+fn char_width<const CJK: bool>(c: char) -> Option<usize> {
+    match c as u32 {
+        _c @ 0 => Some(0),          // null is zero width
+        cu if cu < 0x20 => None,    // control sequences have no width
+        cu if cu < 0x7F => Some(1), // ASCII
+        cu if cu < 0xA0 => None,    // more control sequences
+        _ => Some(get_width::<CJK>(c))
+    }
+}
 impl UnicodeWidthChar for char {
     #[inline]
-    fn width(self) -> Option<usize> { cw::width(self, false) }
+    fn width(self) -> Option<usize> { 
+        char_width::<false>(self)
+    }
 
     #[inline]
-    fn width_cjk(self) -> Option<usize> { cw::width(self, true) }
+    fn width_cjk(self) -> Option<usize> { 
+        char_width::<true>(self)
+    }
 }
 
 /// Methods for determining displayed width of Unicode strings.
@@ -121,11 +146,11 @@ pub trait UnicodeWidthStr {
 impl UnicodeWidthStr for str {
     #[inline]
     fn width(&self) -> usize {
-        self.chars().map(|c| cw::width(c, false).unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| c.width().unwrap_or(0)).fold(0, Add::add)
     }
 
     #[inline]
     fn width_cjk(&self) -> usize {
-        self.chars().map(|c| cw::width(c, true).unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| c.width_cjk().unwrap_or(0)).fold(0, Add::add)
     }
 }
