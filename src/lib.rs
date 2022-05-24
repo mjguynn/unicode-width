@@ -100,12 +100,20 @@ fn get_width<const CJK: bool>(c: char) -> usize {
 }
 #[inline(always)]
 fn char_width<const CJK: bool>(c: char) -> Option<usize> {
-    match c as u32 {
-        _c @ 0 => Some(0),          // null is zero width
-        cu if cu < 0x20 => None,    // control sequences have no width
-        cu if cu < 0x7F => Some(1), // ASCII
-        cu if cu < 0xA0 => None,    // more control sequences
-        _ => Some(get_width::<CJK>(c))
+    let cu = c as u32;
+    if cu < 0x7F {
+        if cu > 0x1F {
+            Some(1)
+        } else if cu == 0 {
+            Some(0)
+        } else {
+            None
+        }
+    } else if cu >= 0xA0 {
+        Some(get_width::<CJK>(c))
+    }
+    else {
+        None
     }
 }
 impl UnicodeWidthChar for char {
