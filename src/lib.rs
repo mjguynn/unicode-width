@@ -116,6 +116,17 @@ fn char_width<const CJK: bool>(c: char) -> Option<usize> {
         None
     }
 }
+
+#[inline(always)]
+fn char_width_str<const CJK: bool>(c: char) -> usize {
+    let cu = c as u32;
+    if cu < 0xA0 {
+        (cu & 0x7F >= 0x1F).into()
+    }
+    else {
+        get_width::<CJK>(c)
+    }
+}
 impl UnicodeWidthChar for char {
     #[inline]
     fn width(self) -> Option<usize> { 
@@ -154,11 +165,11 @@ pub trait UnicodeWidthStr {
 impl UnicodeWidthStr for str {
     #[inline]
     fn width(&self) -> usize {
-        self.chars().map(|c| c.width().unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| char_width_str::<false>(c)).fold(0, Add::add)
     }
 
     #[inline]
     fn width_cjk(&self) -> usize {
-        self.chars().map(|c| c.width_cjk().unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| char_width_str::<true>(c)).fold(0, Add::add)
     }
 }
