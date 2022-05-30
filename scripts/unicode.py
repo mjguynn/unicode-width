@@ -18,8 +18,6 @@
 # Since this should not require frequent updates, we just store this
 # out-of-line and check the generated.rs file into git.
 
-from itertools import zip_longest
-from functools import reduce
 import re, os, sys, enum
 
 # Unicode codespace is 0..=0x10FFFF
@@ -135,36 +133,46 @@ def merge_properties(props: "tuple[CondensedWidth, CondensedCategory]") -> "Cond
     (eaw, cat) = props
     return CondensedWidth.ZERO if cat == CondensedCategory.ZERO_WIDTH else eaw
 
-def make_key(codepoint: int, width: CondensedWidth) -> int:
-    return (codepoint << 4) | int(width)
-
-def compress_properties(props: "list[CondensedWidth]") -> "list[int]":
+def compress_properties(props: "list[CondensedWidth]") -> "list[tuple[int, int]]":
     compressed_list = []
     last_width = None
 
     for codepoint, width in enumerate(props):
         if width != last_width:
             last_width = width
-            compressed_list.append(make_key(codepoint, width))
+            compressed_list.append((codepoint, width))
     
     return compressed_list
 
-def reduce_nodes(descending_iter) -> "list[list[int]]":
-    """Conceptually: copies descending_iter, maps each node to its minimum key, then merges 
-    adjacent keys in descending order into nodes (padding the last node with 0x1 if necessary)"""
-    return list(zip_longest( *([descending_iter] * NUM_NODE_KEYS), fillvalue=0x1)) 
-
-def build_base_layer(compressed_props: "list[int]") -> "list[list[int]]":
-    """Create a list of NUM_NODE_KEY-key nodes with keys in descending order"""
+def build_base_layer(compressed_props) -> "list[tuple[list[int], int]]":
     descending = sorted(compressed_props, reverse=True)
-    return reduce_nodes(iter(descending))
+    base_layer = []
+    i = 0
+    while i < len(descending):
+        node = []
+        for j in range(0, NUM_NODE_KEYS):
+            node.append((0,0) if i+j >= len(descending) else descending[i+j])
+        base_layer.append((node, node[-1]))
+        i += NUM_NODE_KEYS
+    return base_layer
 
-def build_next_layer(prev_layer: "list[list[int]]") -> "list[list[int]]":
-    return reduce_nodes(map(min, prev_layer))
+def build_next_layer(prev_layer):
+    next_layer = []
+    i = 0
+    while i < len(prev_layer):
+        node = []
+        for j in range(0, NUM_NODE_KEYS + 1):
+            node.append((0,0) if i+j >= len(prev_layer) else prev_layer[i+j][1])
+        next_layer.append((node[:-1], node[-1]))
+        i += (NUM_NODE_KEYS + 1)
+    return next_layer
 
-def flatten_layers(bottom_up: "list[list[int]]") -> "tuple[list[list[int]], list[int]]":
+def flatten_layers(bottom_up):
     top_down = list(reversed(bottom_up))
-    flattened = list(reduce(lambda x,y : x+y, top_down, []))
+    flattened = []
+    for layer in top_down:
+        for (node, _) in layer:
+            flattened.append(node)
     layer_offsets = [0]
     for layer in top_down:
         layer_offsets.append(layer_offsets[-1] + len(layer))
@@ -174,7 +182,7 @@ def flatten_layers(bottom_up: "list[list[int]]") -> "tuple[list[list[int]], list
 def emit_module(
     out_name: str, 
     version: "tuple[int, int, int]",
-    flattened_layers: "list[list[int]]", 
+    flattened_layers: "list[list[tuple[int, int]]]", 
     layer_offsets: "list[int]"
     ):
     if os.path.exists(out_name):
@@ -220,10 +228,10 @@ pub const TREE_NODES: [SearchNode; %s] = [""" % len(flattened_layers))
         for i, node in enumerate(flattened_layers):
             if i in layer_offsets:
                 of.write('\n') # visually delimit the layers
-            of.write("\tSearchNode {keys: [")
-            for key in node[:-1]:
-                of.write(f"0x{key:07X}, ")
-            of.write(f"0x{node[-1]:07X}] }},\n")
+            of.write("\tSearchNode::from_keys([")
+            for (codepoint, width) in node:
+                of.write(f"('\\u{{{codepoint:06X}}}', {width}), ")
+            of.write(f"]),\n")
         of.write("];\n")
 
 if __name__ == "__main__":

@@ -60,6 +60,7 @@ pub use generated::UNICODE_VERSION;
 
 use core::ops::Add;
 
+mod search;
 mod generated;
 
 #[cfg(test)]
@@ -86,47 +87,27 @@ pub trait UnicodeWidthChar {
     fn width_cjk(self) -> Option<usize>;
 }
 
-fn get_width<const CJK: bool>(c: char) -> usize {
-    let needle = (u32::from(c) << 4) | 0b1000;
-    let i = generated::CODEPOINT_PROPERTIES.binary_search(&needle).unwrap_err();
-    let width = generated::CODEPOINT_PROPERTIES[i-1] & 0b11;
-    if width == 3 {
-       return if CJK { 2 } else { 1 };
-    }
-    else {
-        return width as usize
-    }
-    
-}
-#[inline(always)]
-fn char_width<const CJK: bool>(c: char) -> Option<usize> {
-    let cu = c as u32;
-    if cu < 0x7F {
-        if cu > 0x1F {
+fn char_width<const CJK: bool>(c: char) -> Option<usize>{
+    if c < '\u{7F}' {
+        if c > '\u{1F}' {
             Some(1)
-        } else if cu == 0 {
+        } else if c == '\0' {
             Some(0)
         } else {
             None
         }
-    } else if cu >= 0xA0 {
-        Some(get_width::<CJK>(c))
+    } else if c >= '\u{A0}' {
+        let mut table_width = search::table_width(c).into();
+        if table_width == 3 {
+            table_width = if CJK {2} else {1}
+        }
+        Some(table_width)
     }
     else {
         None
     }
 }
 
-#[inline(always)]
-fn char_width_str<const CJK: bool>(c: char) -> usize {
-    let cu = c as u32;
-    if cu < 0xA0 {
-        (cu & 0x7F >= 0x1F).into()
-    }
-    else {
-        get_width::<CJK>(c)
-    }
-}
 impl UnicodeWidthChar for char {
     #[inline]
     fn width(self) -> Option<usize> { 
@@ -165,11 +146,11 @@ pub trait UnicodeWidthStr {
 impl UnicodeWidthStr for str {
     #[inline]
     fn width(&self) -> usize {
-        self.chars().map(|c| char_width_str::<false>(c)).fold(0, Add::add)
+        self.chars().map(|c| c.width().unwrap_or(0)).fold(0, Add::add)
     }
 
     #[inline]
     fn width_cjk(&self) -> usize {
-        self.chars().map(|c| char_width_str::<true>(c)).fold(0, Add::add)
+        self.chars().map(|c| c.width_cjk().unwrap_or(0)).fold(0, Add::add)
     }
 }
