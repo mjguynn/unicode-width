@@ -64,6 +64,7 @@ impl SearchNode {
 
 pub fn table_width(c: char) -> usize {
     const NUM_LAYERS: usize = LAYER_OFFSETS.len();
+    const LAST_OFFSET: usize = LAYER_OFFSETS[NUM_LAYERS - 1];
     let needle = SearchNeedle::new(c);
     // search through the min-key layers
     let mut index = 0;
@@ -72,6 +73,6 @@ pub fn table_width(c: char) -> usize {
         index = (index * (KEYS_PER_NODE + 1)) + node.search(needle);
     }
     // final layer
-    let node = &TREE_NODES[LAYER_OFFSETS[NUM_LAYERS - 1] + index];
+    let node = &TREE_NODES[LAST_OFFSET + index];
     return node.width_at(node.search(needle));
 }
