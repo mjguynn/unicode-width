@@ -24,7 +24,11 @@ import re, os, sys, enum
 # Unicode codespace is 0..=0x10FFFF
 NUM_CODEPOINTS = 0x110000
 
-KEYS_PER_NODE = 16
+KEYS_PER_NODE = 12
+
+# This should be kept in sync with #[repr(align(N))] in search.rs, but it's not critical.
+# It only affects the size estimation this script prints to the console.
+NODE_ALIGNMENT = 64
 
 # Size of a Rust u32 in bytes
 SIZE_U32 = 4
@@ -271,7 +275,8 @@ if __name__ == "__main__":
             break
 
     (flattened_search, offsets) = flatten_search_layers(search_layers)
-    approx_memory = (len(flattened_search) + len(data_layer)) * KEYS_PER_NODE * SIZE_U32
+    node_size = int((KEYS_PER_NODE * SIZE_U32 + NODE_ALIGNMENT - 1) / NODE_ALIGNMENT) * NODE_ALIGNMENT
+    approx_memory = (len(flattened_search) + len(data_layer)) * node_size
     print(f"Representation size: {approx_memory} bytes")
 
     emit_module("generated.rs", version, data_layer, flattened_search, offsets)
