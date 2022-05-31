@@ -87,21 +87,17 @@ pub trait UnicodeWidthChar {
     fn width_cjk(self) -> Option<usize>;
 }
 
-fn char_width<const CJK: bool>(c: char) -> Option<usize>{
-    if c < '\u{7F}' {
-        if c > '\u{1F}' {
+fn char_width(codepoint: char, is_cjk: bool) -> Option<usize>{
+    if codepoint < '\u{7F}' {
+        if codepoint > '\u{1F}' {
             Some(1)
-        } else if c == '\0' {
+        } else if codepoint == '\0' {
             Some(0)
         } else {
             None
         }
-    } else if c >= '\u{A0}' {
-        let mut table_width = search::table_width(c).into();
-        if table_width == 3 {
-            table_width = if CJK {2} else {1}
-        }
-        Some(table_width)
+    } else if codepoint >= '\u{A0}' {
+        Some(search::lookup_width(codepoint, is_cjk))
     }
     else {
         None
@@ -111,12 +107,12 @@ fn char_width<const CJK: bool>(c: char) -> Option<usize>{
 impl UnicodeWidthChar for char {
     #[inline]
     fn width(self) -> Option<usize> { 
-        char_width::<false>(self)
+        char_width(self, false)
     }
 
     #[inline]
     fn width_cjk(self) -> Option<usize> { 
-        char_width::<true>(self)
+        char_width(self, true)
     }
 }
 

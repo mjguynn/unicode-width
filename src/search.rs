@@ -1,4 +1,4 @@
-// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
+// Copyright 2012-2022 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
 // http://rust-lang.org/COPYRIGHT.
 //
@@ -37,8 +37,12 @@ impl Key {
     fn less_than(&self, needle: Needle) -> bool {
         self.0 < u32::from(needle)
     }
-    fn width(&self) -> usize {
-        (self.0 & WIDTH_MASK) as usize
+    fn width(&self, is_cjk: bool) -> usize {
+        match (self.0 & WIDTH_MASK, is_cjk) {
+            (3, true) => 2,
+            (3, false) => 1,
+            (w, _) => w as usize
+        }
     }
 }
 impl From<Key> for u32 {
@@ -57,15 +61,15 @@ pub struct Node {
     keys: [Key; KEYS_PER_NODE]
 }
 impl Node {
-    pub const fn from_keys(keys: [(char, usize); KEYS_PER_NODE]) -> Node {
-        let mut compressed_keys = [Key::new('\0', 0); KEYS_PER_NODE];
+    pub const fn new(key_map: [(char, usize); KEYS_PER_NODE]) -> Node {
+        let mut keys = [Key::new('\0', 0); KEYS_PER_NODE];
         let mut i = 0;
         while i < KEYS_PER_NODE {
-            let (codepoint, width) = keys[i];
-            compressed_keys[i] = Key::new(codepoint, width);
+            let (codepoint, width) = key_map[i];
+            keys[i] = Key::new(codepoint, width);
             i += 1;
         }
-        Node { keys: compressed_keys }
+        Node { keys }
     }
     fn search(&self, needle: Needle) -> usize {
         for i in 0..KEYS_PER_NODE {
@@ -75,17 +79,17 @@ impl Node {
         }
         return KEYS_PER_NODE
     }
-    fn width(&self, needle: Needle) -> usize {
+    fn needle_width(&self, needle: Needle, is_cjk: bool) -> usize {
         for i in 0..(KEYS_PER_NODE-1) {
             if self.keys[i].less_than(needle) {
-                return self.keys[i].width()
+                return self.keys[i].width(is_cjk)
             }
         }
-        return self.keys[KEYS_PER_NODE-1].width()
+        return self.keys[KEYS_PER_NODE-1].width(is_cjk)
     }
 }
 
-pub fn table_width(codepoint: char) -> usize {
+pub fn lookup_width(codepoint: char, is_cjk: bool) -> usize {
     let needle = Needle::new(codepoint);
     // use the search nodes to get the offset of the data block
     let mut index = 0;
@@ -94,5 +98,5 @@ pub fn table_width(codepoint: char) -> usize {
         index = (index * (KEYS_PER_NODE + 1)) + node.search(needle);
     }
     // grab that block from the data layer and linearly search through its keys
-    return DATA_NODES[index].width(needle)
+    return DATA_NODES[index].needle_width(needle, is_cjk)
 }
