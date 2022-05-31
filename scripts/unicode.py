@@ -16,22 +16,27 @@
 # - UnicodeData.txt
 #
 # Since this should not require frequent updates, we just store this
-# out-of-line and check the generated.rs file into git.
+# out-of-line and check the generated module into git.
 
 from functools import reduce
 import re, os, sys, enum
 
-# Unicode codespace is 0..=0x10FFFF
+
 NUM_CODEPOINTS = 0x110000
+""" An upper bound for which `range(0, NUM_CODEPOINTS)` contains the entire Unicode codespace. """
+
 
 KEYS_PER_NODE = 12
+""" The number of keys in each node. 
+    Note that each node has (KEYS_PER_NODE + 1) children, except for data (leaf) nodes. """
 
-# This should be kept in sync with #[repr(align(N))] in search.rs, but it's not critical.
-# It only affects the size estimation this script prints to the console.
 NODE_ALIGNMENT = 64
+""" The alignment of each node, in bytes.
+    Ideally, this should be kept in sync with `#[repr(align(N))]` in `search.rs`, but it only 
+    affects the size estimation this script prints to the console. """
 
-# Size of a Rust u32 in bytes
-SIZE_U32 = 4
+KEY_SIZE = 4
+""" The size of each key, in bytes."""
 
 def fetch_open(f):
     if not os.path.exists(os.path.basename(f)):
@@ -56,7 +61,7 @@ class CondensedWidth(enum.IntEnum):
     AMBIGUOUS = 3
 
 def load_condensed_widths() -> "list[CondensedWidth]":
-    """Return a list of condensed widths, indexed by codepoint. 
+    """Return a list of condensed widths, indexed by codepoint, according to `EastAsianWidth.txt`.
     
     `Neutral`, `Narrow`, and `Halfwidth` characters are assigned 
     `CondensedWidth.NARROW`.
@@ -64,8 +69,6 @@ def load_condensed_widths() -> "list[CondensedWidth]":
     `Wide` and `Fullwidth` characters are assigned `CondensedWidth.WIDE`. 
     
     `Ambiguous` chracters are assigned `CondensedWidth.AMBIGUOUS`. 
-
-    Note that this *EXCLUSIVELY* assigns widths according to `EastAsianWidth.txt`.
     """
     with fetch_open("EastAsianWidth.txt") as eaw:
         re1 = re.compile("^([0-9A-F]+);(\w+) +# (\w+)")
@@ -115,7 +118,7 @@ def load_condensed_categories() -> "list[CondensedCategory]":
             if len(raw_data := line.split(';')) != 15:
                 continue
             [codepoint, name, cat_code] = [int(raw_data[0], 16), raw_data[1], raw_data[2]]
-            cat = CondensedCategory.ZERO_WIDTH if cat_code in ["Cf", "Mn", "Me"] \
+            cat = CondensedCategory.ZERO_WIDTH if cat_code in ["Cc", "Cf", "Mn", "Me"] \
                 else CondensedCategory.OTHER
 
             assert current <= codepoint
@@ -133,8 +136,7 @@ def load_condensed_categories() -> "list[CondensedCategory]":
         return cat_map
 
 def merge_properties(props: "tuple[CondensedWidth, CondensedCategory]") -> "CondensedWidth":
-    (eaw, cat) = props
-    return CondensedWidth.ZERO if cat == CondensedCategory.ZERO_WIDTH else eaw
+    return CondensedWidth.ZERO if props[1] == CondensedCategory.ZERO_WIDTH else props[0]
 
 def compress_properties(props: "list[CondensedWidth]") -> "list[tuple[int, CondensedWidth]]":
     compressed_list = []
@@ -254,6 +256,7 @@ if __name__ == "__main__":
     eaw_map = load_condensed_widths()
     cat_map = load_condensed_categories()
     property_map = list(map(merge_properties, zip(eaw_map, cat_map)))
+    
     # Override for soft hyphen
     property_map[0x00AD] = CondensedWidth.NARROW
     # Override for Hangul Jamo medial vowels & final consonants
@@ -275,7 +278,7 @@ if __name__ == "__main__":
             break
 
     (flattened_search, offsets) = flatten_search_layers(search_layers)
-    node_size = int((KEYS_PER_NODE * SIZE_U32 + NODE_ALIGNMENT - 1) / NODE_ALIGNMENT) * NODE_ALIGNMENT
+    node_size = int((KEYS_PER_NODE * KEY_SIZE + NODE_ALIGNMENT - 1) / NODE_ALIGNMENT) * NODE_ALIGNMENT
     approx_memory = (len(flattened_search) + len(data_layer)) * node_size
     print(f"Representation size: {approx_memory} bytes")
 
