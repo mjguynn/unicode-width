@@ -51,11 +51,6 @@ impl From<Key> for u32 {
     }
 }
 
-/// A group of [KEYS_PER_NODE] keys, stored as `u32`s in descending order.
-/// # Alignment
-/// Currently, each `Node` is 64 bytes, which is the typical size of a cache line.
-/// With 64 byte alignment each `Node` will fit into exactly one cache line.
-/// If the size of this struct ever changes, its alignment may need to be modified.
 #[repr(align(64))]
 pub struct Node {
     keys: [Key; KEYS_PER_NODE]
