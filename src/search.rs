@@ -8,71 +8,91 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::generated::{LAYER_OFFSETS, TREE_NODES};
-
-const KEYS_PER_NODE: usize = 16;
+use crate::generated::{KEYS_PER_NODE, SEARCH_OFFSETS, SEARCH_NODES, DATA_NODES};
 
 const CODEPOINT_SHIFT: u32 = 4;
 
 const WIDTH_MASK: u32 = 0b11;
 
 #[derive(Clone,Copy)]
-struct SearchNeedle(u32);
-impl SearchNeedle {
-    fn new(codepoint: char) -> SearchNeedle {
-        SearchNeedle((u32::from(codepoint) << CODEPOINT_SHIFT) | (WIDTH_MASK + 1))
+struct Needle(u32);
+impl Needle {
+    fn new(codepoint: char) -> Self {
+        Self((u32::from(codepoint) << CODEPOINT_SHIFT) | (WIDTH_MASK + 1))
     }
 }
-impl From<SearchNeedle> for u32 {
-    fn from(input: SearchNeedle) -> Self {
+impl From<Needle> for u32 {
+    fn from(input: Needle) -> Self {
         input.0
     }
 }
+
+#[derive(Clone,Copy)]
+struct Key(u32);
+impl Key {
+    const fn new(codepoint: char, width: usize) -> Self {
+        assert!(width <= WIDTH_MASK as usize);
+        Self(((codepoint as u32) << CODEPOINT_SHIFT) | (width as u32))
+    }
+    fn less_than(&self, needle: Needle) -> bool {
+        self.0 < u32::from(needle)
+    }
+    fn width(&self) -> usize {
+        (self.0 & WIDTH_MASK) as usize
+    }
+}
+impl From<Key> for u32 {
+    fn from(input: Key) -> Self {
+        input.0
+    }
+}
+
 /// A group of [KEYS_PER_NODE] keys, stored as `u32`s in descending order.
 /// # Alignment
-/// Currently, each `SearchNode` is 64 bytes, which is the typical size of a cache line.
-/// With 64 byte alignment each `SearchNode` will fit into exactly one cache line.
+/// Currently, each `Node` is 64 bytes, which is the typical size of a cache line.
+/// With 64 byte alignment each `Node` will fit into exactly one cache line.
 /// If the size of this struct ever changes, its alignment may need to be modified.
 #[repr(align(64))]
-pub struct SearchNode {
-    keys: [u32; KEYS_PER_NODE]
+pub struct Node {
+    keys: [Key; KEYS_PER_NODE]
 }
-impl SearchNode {
-    pub const fn from_keys(uncompressed_keys: [(char, usize); KEYS_PER_NODE]) -> SearchNode {
-        let mut keys = [0; KEYS_PER_NODE];
+impl Node {
+    pub const fn from_keys(keys: [(char, usize); KEYS_PER_NODE]) -> Node {
+        let mut compressed_keys = [Key::new('\0', 0); KEYS_PER_NODE];
         let mut i = 0;
         while i < KEYS_PER_NODE {
-            let (codepoint, width) = uncompressed_keys[i];
-            assert!(width as u32 <= WIDTH_MASK);
-            keys[i] = ((codepoint as u32) << CODEPOINT_SHIFT) | (width as u32);
+            let (codepoint, width) = keys[i];
+            compressed_keys[i] = Key::new(codepoint, width);
             i += 1;
         }
-        SearchNode { keys }
+        Node { keys: compressed_keys }
     }
-    fn search(&self, needle: SearchNeedle) -> usize {
+    fn search(&self, needle: Needle) -> usize {
         for i in 0..KEYS_PER_NODE {
-            if self.keys[i] < u32::from(needle) {
+            if self.keys[i].less_than(needle) {
                 return i
             }
         }
         return KEYS_PER_NODE
     }
-    fn width_at(&self, index: usize) -> usize {
-        (self.keys[index] & WIDTH_MASK) as usize
+    fn width(&self, needle: Needle) -> usize {
+        for i in 0..(KEYS_PER_NODE-1) {
+            if self.keys[i].less_than(needle) {
+                return self.keys[i].width()
+            }
+        }
+        return self.keys[KEYS_PER_NODE-1].width()
     }
 }
 
-pub fn table_width(c: char) -> usize {
-    const NUM_LAYERS: usize = LAYER_OFFSETS.len();
-    const LAST_OFFSET: usize = LAYER_OFFSETS[NUM_LAYERS - 1];
-    let needle = SearchNeedle::new(c);
-    // search through the min-key layers
+pub fn table_width(codepoint: char) -> usize {
+    let needle = Needle::new(codepoint);
+    // use the search nodes to get the offset of the data block
     let mut index = 0;
-    for i in 0..(NUM_LAYERS-1) {
-        let node = &TREE_NODES[LAYER_OFFSETS[i] + index];
+    for layer in SEARCH_OFFSETS {
+        let node = &SEARCH_NODES[layer + index];
         index = (index * (KEYS_PER_NODE + 1)) + node.search(needle);
     }
-    // final layer
-    let node = &TREE_NODES[LAST_OFFSET + index];
-    return node.width_at(node.search(needle));
+    // grab that block from the data layer and linearly search through its keys
+    return DATA_NODES[index].width(needle)
 }
