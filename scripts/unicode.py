@@ -19,13 +19,18 @@
 # out-of-line and check the generated module into git.
 
 from functools import reduce
-import re, os, sys, enum
+from itertools import combinations
+from subprocess import run
+import re, os, sys, enum, math, ctypes
 
 
 NUM_CODEPOINTS = 0x110000
 """ An upper bound for which `range(0, NUM_CODEPOINTS)` contains the entire Unicode codespace. """
 
-KEYS_PER_NODE = 12
+NUM_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
+""" The maximum number of bits required to represent a Unicode codepoint."""
+
+KEYS_PER_NODE = 16
 """ The number of keys in each node. 
     Note that each node has (KEYS_PER_NODE + 1) children, except for data (leaf) nodes. """
 
@@ -38,6 +43,9 @@ KEY_SIZE = 4
 """ The size of each key, in bytes.
     Ideally, this should be kept in sync with `search.rs`, but like `NODE_ALIGNMENT` it only
     affects size estimation."""
+
+NUM_LUT_BITS = 6
+""" The number of bits used for indexing into the generated LUT. """
 
 def fetch_open(f):
     """ Opens `f` and return its corresponding file object. If `f` isn't present on disk, fetches  
@@ -140,6 +148,46 @@ def load_zero_widths() -> "list[bool]":
             zw_map.append(False)
 
         return zw_map
+
+class AnalysisResults(ctypes.Structure):
+    _fields_ = [("num_printable_ascii", ctypes.c_uint32), ("num_compressed", ctypes.c_uint32)]
+    def ascii_info(self) -> str:
+        total = 0x7F - 0x20
+        percent = 100.0 * self.num_printable_ascii / total
+        return f"{percent:.2f}% printable ASCII chars compressed ({self.num_printable_ascii}/{total})"
+    def total_info(self) -> str:
+        percent = 100.0 * self.num_compressed / NUM_CODEPOINTS
+        return f"{percent:.2f}% total codepoints compressed ({self.num_compressed}/{NUM_CODEPOINTS})"
+
+
+def analyze_lut(width_map: "list[EffectiveWidth]", bits: "list[int]"):
+    analysis_lut = [0] * len(width_map)
+    mask = reduce(lambda acc, bit : acc | (1 << bit), bits, 0)
+    for codepoint, width in enumerate(width_map):
+        analysis_lut[codepoint & mask] |= (1 << int(width))
+    # Observe that every successfully compressed block will have exactly one set bit (power of two)
+    is_power_two = lambda n : n != 0 and (n & (n-1) == 0)
+    return sum(1 for _ in filter(is_power_two, analysis_lut))
+
+def find_optimal_lut_bits(width_map: "list[EffectiveWidth]", num_bits: int) -> "tuple[int, list[int]]":
+    ALL_BITS = [i for i in range(0, NUM_CODEPOINT_BITS)]
+    rs_path = os.path.join(os.path.dirname(__file__), "analyze.rs")
+    base_cmd = f"rustc -O --crate-type cdylib --edition 2021 \"{rs_path}\""
+    # get the output library name, with extension, in a platform-agnostic fashion
+    lib_name = run(base_cmd + " --print file-names", text=True, capture_output=True).stdout.strip()
+    # actually compile the library
+    if run(base_cmd).returncode != 0:
+        sys.stderr.write(f"couldn't compile analysis library")
+        exit(1)
+    lib_path = os.path.join(os.getcwd(), lib_name)
+    lib = ctypes.CDLL(lib_path)
+    lib.analyze.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32, ctypes.c_uint32]
+    lib.analyze.restype = AnalysisResults
+    widths = (ctypes.c_uint8 * len(width_map))(*width_map)
+    def analyze(bits: "list[int]"):
+        mask = reduce(lambda acc, bit : acc | (1 << bit), bits, 0)
+        return (lib.analyze(widths, len(width_map), mask), bits)
+    return max(map(analyze, combinations(ALL_BITS, num_bits)), key=lambda res: res[0].num_compressed)
 
 def compress_widths(widths: "list[EffectiveWidth]") -> "list[tuple[int, EffectiveWidth]]":
     """ Input: an array for which `widths[c]` is the computed width of codepoint `c`.
@@ -293,6 +341,13 @@ if __name__ == "__main__":
     # Override for Hangul Jamo medial vowels & final consonants
     for i in range(0x1160, 0x11FF + 1):
         width_map[i] = EffectiveWidth.ZERO
+
+    print(f"Building LUT using {NUM_LUT_BITS} bits. This will take a while...")
+    (results, bits) = find_optimal_lut_bits(width_map, NUM_LUT_BITS)
+    print(f"\t{results.ascii_info()}")
+    print(f"\t{results.total_info()}")
+    print(f"\tBit indices: {bits}")
+    
 
     compressed_widths = compress_widths(width_map)
     print(f"Compressed partition has {len(compressed_widths)} keys")
