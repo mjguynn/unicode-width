@@ -37,12 +37,8 @@ impl Key {
     fn less_than(&self, needle: Needle) -> bool {
         self.0 < u32::from(needle)
     }
-    fn width(&self, is_cjk: bool) -> usize {
-        match (self.0 & WIDTH_MASK, is_cjk) {
-            (3, true) => 2,
-            (3, false) => 1,
-            (w, _) => w as usize
-        }
+    fn width(&self) -> u8 {
+        (self.0 & WIDTH_MASK) as u8
     }
 }
 impl From<Key> for u32 {
@@ -74,17 +70,17 @@ impl Node {
         }
         return KEYS_PER_NODE
     }
-    fn needle_width(&self, needle: Needle, is_cjk: bool) -> usize {
+    fn needle_width(&self, needle: Needle) -> u8 {
         for i in 0..(KEYS_PER_NODE-1) {
             if self.keys[i].less_than(needle) {
-                return self.keys[i].width(is_cjk)
+                return self.keys[i].width()
             }
         }
-        return self.keys[KEYS_PER_NODE-1].width(is_cjk)
+        return self.keys[KEYS_PER_NODE-1].width()
     }
 }
 
-pub fn lookup_width(codepoint: char, is_cjk: bool) -> usize {
+pub fn lookup_width(codepoint: char) -> u8 {
     let needle = Needle::new(codepoint);
     // use the search nodes to get the offset of the data block
     let mut index = 0;
@@ -93,5 +89,5 @@ pub fn lookup_width(codepoint: char, is_cjk: bool) -> usize {
         index = (index * (KEYS_PER_NODE + 1)) + node.search(needle);
     }
     // grab that block from the data layer and linearly search through its keys
-    return DATA_NODES[index].needle_width(needle, is_cjk)
+    return DATA_NODES[index].needle_width(needle)
 }

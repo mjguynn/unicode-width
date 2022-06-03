@@ -87,21 +87,41 @@ pub trait UnicodeWidthChar {
     fn width_cjk(self) -> Option<usize>;
 }
 
-fn char_width(codepoint: char, is_cjk: bool) -> Option<usize>{
-    if codepoint < '\u{7F}' {
-        if codepoint > '\u{1F}' {
+#[inline(always)]
+fn char_width(c: char, is_cjk: bool) -> Option<usize>{
+    if c < '\u{7F}' {
+        if c > '\u{1F}' {
             Some(1)
-        } else if codepoint == '\0' {
+        } else if c == '\0' {
             Some(0)
         } else {
             None
         }
-    } else if codepoint >= '\u{A0}' {
-        Some(search::lookup_width(codepoint, is_cjk))
+    } else if c >= '\u{A0}' {
+        let mut width = search::lookup_width(c);
+        if width == 3 {
+            width = if is_cjk {2} else {1}
+        }
+        Some(width as usize)
     }
     else {
         None
     }
+}
+
+#[inline(always)]
+fn char_width_raw(c: char, is_cjk: bool) -> usize {
+    let mut width = generated::HASH_TABLE[generated::hash_char(c)];
+    if c < '\u{7F}' {
+        return usize::from(c >= '\u{20}')
+    }
+    if width == 4 {
+        width = search::lookup_width(c)
+    }
+    if width == 3 {
+        width = if is_cjk {2} else {1}
+    }
+    return width as usize
 }
 
 impl UnicodeWidthChar for char {
@@ -142,11 +162,11 @@ pub trait UnicodeWidthStr {
 impl UnicodeWidthStr for str {
     #[inline]
     fn width(&self) -> usize {
-        self.chars().map(|c| c.width().unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| char_width_raw(c, false)).fold(0, Add::add)
     }
 
     #[inline]
     fn width_cjk(&self) -> usize {
-        self.chars().map(|c| c.width_cjk().unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| char_width_raw(c, true)).fold(0, Add::add)
     }
 }

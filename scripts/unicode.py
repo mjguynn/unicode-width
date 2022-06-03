@@ -39,6 +39,9 @@ KEY_SIZE = 4
     Ideally, this should be kept in sync with `search.rs`, but like `NODE_ALIGNMENT` it only
     affects size estimation."""
 
+HASH = [(9, 2), (16,4)]
+""" todo: (start, shift) hash segment lengths"""
+
 def fetch_open(f):
     """ Opens `f` and return its corresponding file object. If `f` isn't present on disk, fetches  
         it from `http://www.unicode.org/Public/UNIDATA/`. Exits with code 1 on failure. """
@@ -67,6 +70,9 @@ class EffectiveWidth(enum.IntEnum):
     """ Two columns wide. """
     AMBIGUOUS = 3
     """ Two columns wide in a CJK context. One column wide in all other contexts. """
+    DEFER = 4
+    """ This isn't a real width. It can only occur in the context of the hash map, and indicates 
+        that the search/data nodes should be consulted for the actual width of the character. """
 
 def load_east_asian_widths() -> "list[EffectiveWidth]":
     """ Return a list of effective widths, indexed by codepoint.
@@ -140,8 +146,40 @@ def load_zero_widths() -> "list[bool]":
             zw_map.append(False)
 
         return zw_map
+        
+def hash(codepoint: int) -> int:
+    hashed = 0
+    next_index = 0
+    for (start, len) in HASH:
+        hashed |= ((codepoint >> start) & ((1 << len) - 1)) << next_index
+        next_index += len
+    return hashed
 
-def compress_widths(widths: "list[EffectiveWidth]") -> "list[tuple[int, EffectiveWidth]]":
+def hash_to_rust_expr(param_name: str) -> str:
+    """ Generates a Rust expression which takes a variable named `param_name` and evaluates 
+        to the hashed version of `param_name` as specified by CODEPOINT_HASH. """
+    extract = lambda start, len : f"({param_name} >> {start}) & 0b{(1 << len) - 1:b}"
+    start, len_acc = HASH[0]
+    expr = f"({extract(start, len_acc)})"
+    for (start, len) in HASH[1:]:
+        expr += f" | (({extract(start, len)}) << {len_acc})"
+        len_acc += len
+    return expr 
+
+def build_hash_table(width_map: "list[EffectiveWidth]") -> "list[EffectiveWidth]":
+    # total number of bits in the hash table is equal to the sum of the hash segment lengths
+    HASH_BITS = reduce(lambda acc, r: acc + r[1], HASH, 0)
+    table = [None] * 2**HASH_BITS
+    for codepoint, width in enumerate(width_map):
+        hashed = hash(codepoint)
+        cur = table[hashed]
+        if cur and cur != width:
+            table[hashed] = EffectiveWidth.DEFER
+        else:
+            table[hashed] = width
+    return table
+
+def compress_widths(widths) -> "list[tuple[int, EffectiveWidth]]":
     """ Input: an array for which `widths[c]` is the computed width of codepoint `c`.
         Output: `compressed`, a partition of the codespace into ranges of uniform effective width.
         Each element in `compressed` is a codepoint-width tuple; the elements are sorted in 
@@ -195,7 +233,7 @@ def flatten_search_layers(search_layers: "list[list[tuple[int, EffectiveWidth]]]
     offsets.pop() # remove the last offset, it's not needed
     return (flattened, offsets)
 
-def node_to_string(node: "list[tuple[int, EffectiveWidth]]") -> str:
+def node_to_rust_expr(node: "list[tuple[int, EffectiveWidth]]") -> str:
     """ Outputs a string containing a Rust expression which constructs a `Node` from `node`. """
     assert len(node) == KEYS_PER_NODE
     out = "Node::new(["
@@ -207,16 +245,18 @@ def node_to_string(node: "list[tuple[int, EffectiveWidth]]") -> str:
 def emit_module(
         out_name: str, 
         unicode_version: "tuple[int, int, int]",
-        data_nodes: "list[list[tuple[int, EffectiveWidth]]]",
+        hash_table: "list[EffectiveWidth]",
+        search_offsets: "list[int]",
         search_nodes: "list[list[tuple[int, EffectiveWidth]]]", 
-        search_offsets: "list[int]"
+        data_nodes: "list[list[tuple[int, EffectiveWidth]]]"
     ):
     """ Outputs a Rust module to `out_name` with the following constants: 
-        - `KEYS_PER_NODE: usize`, same as this script's constant `KEYS_PER_NODE`. 
         - `UNICODE_VERSION: (u8, u8, u8)`, corresponds to `unicode_version`. 
-        - `DATA_NODES: [Node; ...]`, corresponds to `data_nodes`.
+        - `KEYS_PER_NODE: usize`, same as this script's constant `KEYS_PER_NODE`. 
+        - `HASH_TABLE: [u8; ...]`, corresponds to `hash_table`.
+        - `SEARCH_OFFSETS: [usize; ...], corresponds to `search_offsets`. 
         - `SEARCH_NODES: [Node; ...]`, corresponds to `search_nodes`.
-        - `SEARCH_OFFSETS: [usize; ...], corresponds to `search_offsets`. """
+        - `DATA_NODES: [Node; ...]`, corresponds to `data_nodes`. """
     if os.path.exists(out_name):
         os.remove(out_name)
     print(f"Outputting module to \"{out_name}\"")
@@ -236,20 +276,34 @@ def emit_module(
 
 use search::Node;
 """)
-        # Write the Unicode version & doc comment
         of.write("""
 /// The version of [Unicode](http://www.unicode.org/)
 /// that this version of unicode-width is based on.
 pub const UNICODE_VERSION: (u8, u8, u8) = (%s, %s, %s);
 """ % unicode_version)
 
-        # Write the keys per node
+        of.write("""
+/// (todo) 
+pub fn hash_char(c: char) -> usize {
+    let codepoint = u32::from(c);
+    (%s) as usize
+}
+""" % hash_to_rust_expr("codepoint"))
+
+        of.write("""
+/// (todo)
+pub const HASH_TABLE: [u8; %s] = [""" % len(hash_table))
+        for i, width in enumerate(hash_table):
+            if i % 8 == 0:
+                of.write("\n\t")
+            of.write(f"{width}, ")
+        of.write("\n];\n")
+
         of.write("""
 /// (todo)
 pub const KEYS_PER_NODE: usize = %s;
 """ % KEYS_PER_NODE)
 
-        # Write the search layer offsets
         of.write("""
 /// (todo)
 pub const SEARCH_OFFSETS: [usize; %s] = [""" % len(search_offsets))
@@ -257,23 +311,21 @@ pub const SEARCH_OFFSETS: [usize; %s] = [""" % len(search_offsets))
             of.write(f"{offset}, ")
         of.write(f"{search_offsets[-1]}];\n")
 
-        # Write the search nodes
         of.write("""
 /// (todo)
 pub const SEARCH_NODES: [Node; %s] = [""" % len(search_nodes))
         for i, node in enumerate(search_nodes):
             if i in offsets:
                 of.write('\n') # visually delimit the layers
-            of.write(f"\t{node_to_string(node)},\n")
+            of.write(f"\t{node_to_rust_expr(node)},\n")
         of.write("];\n")
 
-        # Write the data nodes
         of.write("""
 /// (todo)
 pub const DATA_NODES: [Node; %s] = [
 """ % len(data_nodes))
         for node in data_nodes:
-            of.write(f"\t{node_to_string(node)},\n")
+            of.write(f"\t{node_to_rust_expr(node)},\n")
         of.write("];\n")
 
 if __name__ == "__main__":
@@ -294,6 +346,10 @@ if __name__ == "__main__":
     for i in range(0x1160, 0x11FF + 1):
         width_map[i] = EffectiveWidth.ZERO
 
+    print(f"Building hash table...")
+    hash_table = build_hash_table(width_map)
+    print(f"\t{len(hash_table)} bytes")
+
     compressed_widths = compress_widths(width_map)
     print(f"Compressed partition has {len(compressed_widths)} keys")
 
@@ -313,4 +369,4 @@ if __name__ == "__main__":
     approx_memory = (len(flattened) + len(data_layer)) * node_size
     print(f"Representation size: {approx_memory} bytes")
 
-    emit_module("generated.rs", version, data_layer, flattened, offsets)
+    emit_module("generated.rs", version, hash_table, offsets, flattened, data_layer)
