@@ -41,6 +41,18 @@ impl Bits {
     fn combinations(&self, n: usize) -> BitComb<'_> {
         BitComb::new(&self, n)
     }
+    /// The number of bits represented by this instance.
+    fn count(&self) -> usize {
+        self.indices.len()
+    }
+    /// Creates a mask, where bit `i` is set iff bit `i` is included in this instance.
+    fn mask(&self) -> usize {
+        let mut result = 0;
+        for &bit_index in self.indices.iter() {
+            result |= 1 << bit_index;
+        } 
+        result
+    }
 }
 impl<T: IntoIterator<Item = u8>> From<T> for Bits {
     fn from(input: T) -> Self {
@@ -84,42 +96,44 @@ impl<'a> Iterator for BitComb<'a> {
     }
 }
 
-#[repr(C)]
-pub struct AnalysisResults {
-    num_printable_ascii: u32,
-    num_compressed: u32,
-}
-
-pub fn test(){
-    let bits = Bits::from(0..UNICODE_BITS);
-    for comb in bits.combinations(6) {
-        println!("{comb:?}");
+fn build_lut(widths: &[u8], bits: &Bits) -> (usize, Vec<usize>) {
+    // First, bucket the codepoints
+    let num_buckets = 1 << bits.count();
+    let bucket_size = (1 << UNICODE_BITS) / num_buckets;
+    let mut buckets = vec![Vec::with_capacity(bucket_size); char::MAX as usize];
+    let mask = bits.mask();
+    for codepoint in 0..(char::MAX as usize) {
+        buckets[codepoint & mask].push(widths[codepoint])
     }
-}
-/// (todo)
-/// # Safety
-/// The operation `std::slice::from_raw_parts(widths, widths_len)` must be sound.
-#[no_mangle]
-pub unsafe extern "C" fn analyze(widths: *const u8, widths_len: u32, mask: u32) -> AnalysisResults
-{
-    let mask = usize::try_from(mask).unwrap();
-    let widths = std::slice::from_raw_parts(widths, usize::try_from(widths_len).unwrap());
-    let mut table = vec![0u8; widths.len()];
-    for (codepoint, &width) in widths.iter().enumerate() {
-        table[codepoint & mask] |= 1 << width
+    // Now, figure out which buckets have identical width patterns
+    let mut patterns = std::collections::HashMap::new();
+    let mut lut = Vec::with_capacity(num_buckets);
+    for pattern in buckets.into_iter() {
+        if pattern.is_empty() {
+            continue;
+        }
+        let len = patterns.len();
+        let index = *patterns.entry(pattern).or_insert(len);
+        lut.push(index);
     }
-
-    let mut num_printable_ascii = 0;
-    let mut num_compressed = 0;
-
-    for i in 0..widths.len() {
-        let val = table[i & mask];
-        if val.is_power_of_two() {
-            num_compressed += 1;
-            if (0x20..0x7F).contains(&i) {
-                num_printable_ascii += 1
-            }
+    (patterns.len(), lut)
+} 
+fn optimal_lut(widths: &[u8], usable: Bits, index_bits: usize) -> (Bits, Vec<usize>, usize) {
+    let mut opt = (Bits::from(0..1), Vec::new(), usize::MAX); // dummy value
+    for candidate in usable.combinations(index_bits) {
+        let (size, lut) = build_lut(widths, &candidate);
+        if size < opt.2 {
+            eprintln!("Lower! Size: {size}");
+            opt = (candidate, lut, size)
         }
     }
-    AnalysisResults { num_printable_ascii, num_compressed }
+    opt
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn optimal(widths: *const u8, widths_len: usize) {
+    let widths = std::slice::from_raw_parts(widths, widths_len);
+    let (bits, lut, size) = optimal_lut(widths, Bits::from(0..UNICODE_BITS), 6);
+    eprintln!("Final: bits {bits:?}, size {size}");
+    eprintln!("{lut:?}");
 }

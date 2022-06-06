@@ -181,13 +181,8 @@ def find_optimal_lut_bits(width_map: "list[EffectiveWidth]", num_bits: int) -> "
         exit(1)
     lib_path = os.path.join(os.getcwd(), lib_name)
     lib = ctypes.CDLL(lib_path)
-    lib.analyze.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32, ctypes.c_uint32]
-    lib.analyze.restype = AnalysisResults
     widths = (ctypes.c_uint8 * len(width_map))(*width_map)
-    def analyze(bits: "list[int]"):
-        mask = reduce(lambda acc, bit : acc | (1 << bit), bits, 0)
-        return (lib.analyze(widths, len(width_map), mask), bits)
-    return max(map(analyze, combinations(ALL_BITS, num_bits)), key=lambda res: res[0].num_compressed)
+    lib.optimal(widths, len(width_map))
 
 def compress_widths(widths: "list[EffectiveWidth]") -> "list[tuple[int, EffectiveWidth]]":
     """ Input: an array for which `widths[c]` is the computed width of codepoint `c`.
@@ -343,10 +338,7 @@ if __name__ == "__main__":
         width_map[i] = EffectiveWidth.ZERO
 
     print(f"Building LUT using {NUM_LUT_BITS} bits. This will take a while...")
-    (results, bits) = find_optimal_lut_bits(width_map, NUM_LUT_BITS)
-    print(f"\t{results.ascii_info()}")
-    print(f"\t{results.total_info()}")
-    print(f"\tBit indices: {bits}")
+    find_optimal_lut_bits(width_map, NUM_LUT_BITS)
     
 
     compressed_widths = compress_widths(width_map)
