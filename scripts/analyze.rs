@@ -114,13 +114,20 @@ impl<'a> Iterator for BitComb<'a> {
 impl<'a> ExactSizeIterator for BitComb<'a> {}
 
 #[derive(Clone)]
-struct LookupBucket {
+struct Bucket {
     chars: Vec<char>,
     widths: Vec<u8>,
 }
-impl LookupBucket {
+impl Bucket {
     fn with_capacity(cap: usize) -> Self {
-        LookupBucket { chars: Vec::with_capacity(cap), widths: Vec::with_capacity(cap) }
+        Self { chars: Vec::with_capacity(cap), widths: Vec::with_capacity(cap) }
+    }
+    fn from_chars(widths: &[u8], chars: impl Iterator<Item = char>) -> Self {
+        let mut bucket = Self::with_capacity(chars.size_hint().0);
+        for ch in chars {
+            bucket.push(ch, widths[ch as usize])
+        }
+        bucket
     }
     fn push(&mut self, ch: char, width: u8) {
         if let Some(&l) = self.chars.last() {
@@ -129,7 +136,7 @@ impl LookupBucket {
         self.chars.push(ch);
         self.widths.push(width);
     }
-    fn consume(&mut self, rhs: &mut LookupBucket) -> bool {
+    fn consume(&mut self, rhs: &mut Self) -> bool {
         if self.widths.len() < rhs.widths.len() {
             if self.widths.as_slice() == &rhs.widths[0..self.widths.len()] {
                 std::mem::swap(&mut self.widths, &mut rhs.widths);
@@ -138,79 +145,126 @@ impl LookupBucket {
                 return true;
             }
         }
-        else {
-            if &self.widths[0..rhs.widths.len()] == rhs.widths.as_slice() {
-                self.chars.append(&mut rhs.chars);
-                self.chars.sort();
-                return true;
-            }
+        else if &self.widths[0..rhs.widths.len()] == rhs.widths.as_slice() {
+            self.chars.append(&mut rhs.chars);
+            self.chars.sort();
+            return true;
         }
         false
     }
+    fn iter(&self) -> impl '_ + Iterator<Item = (&char, &u8)> {
+        self.chars.iter().zip(self.widths.iter())
+    }
+    fn size(&self) -> usize { self.chars.len() }
 }
-struct LookupTable {
-    /// Indices into buckets
-    table: Vec<usize>,
-    buckets: Vec<LookupBucket>
+
+fn make_buckets(parent: &Bucket, bits: &Bits) -> Vec<Bucket> {
+    let num_buckets = 1 << bits.count();
+    let bucket_size = 2*parent.size() / num_buckets;
+    let mut buckets = vec![Bucket::with_capacity(bucket_size); num_buckets];
+    for (&c, &width) in parent.iter() {
+        buckets[bits.extract(c as usize)].push(c, width)
+    }
+    buckets
 }
-impl LookupTable {
-    fn new(widths: &[u8], chars: &[char], bits: &Bits) -> Self {
-        let num_buckets = 1 << bits.count();
-        // overestimation
-        let bucket_size = (1 << UNICODE_BITS) / num_buckets;
-        let mut raw_buckets = vec![LookupBucket::with_capacity(bucket_size); num_buckets];
-        for &ch in chars {
-            raw_buckets[bits.extract(ch as usize)].push(ch, widths[ch as usize])
-        }
-        let mut table = Vec::new();
-        let mut buckets: Vec<LookupBucket> = Vec::new();
-        'next_raw_bucket: for mut raw_bucket in raw_buckets.into_iter() {
-            for i in 0..buckets.len() {
-                if buckets[i].consume(&mut raw_bucket) {
-                    table.push(i);
-                    continue 'next_raw_bucket;
+
+struct IndexedBuckets {
+    indexes: Vec<usize>,
+    buckets: Vec<Bucket>
+}
+impl IndexedBuckets {
+    fn indexes(&self) -> &[usize] {
+        self.indexes.as_slice()
+    }
+    fn buckets(&self) -> &[Bucket] {
+        self.buckets.as_slice()
+    }
+    fn is_uniform(&self) -> bool {
+        for bucket in self.buckets.iter() {
+            let mut iter = bucket.iter();
+            if let Some((_, width)) = iter.next() {
+                if !iter.all(|(_, w)| width == w) {
+                    return false;
                 }
             }
-            table.push(buckets.len());
-            buckets.push(raw_bucket);
         }
-        Self { table, buckets }
-    }
-    fn bucket_count(&self) -> usize {
-        self.buckets.len()
+        true
     }
 }
-fn optimal_lut(widths: &[u8], chars: &[char], usable: Bits, index_bits: usize) 
-    -> (Bits, LookupTable) 
+impl<T: IntoIterator<Item = Bucket>> From<T> for IndexedBuckets {
+    fn from(input: T) -> Self {
+        let mut indexes = Vec::new();
+        let mut buckets: Vec<Bucket> = Vec::new();
+        'next_bucket: for mut bucket in input.into_iter() {
+            // the linear search has an unfortunate time complexity, and a hashmap would be
+            // preferable... however there's some tricky subset logic in consume that can't
+            // be directly translated to the hashmap
+            for i in 0..buckets.len() {
+                if buckets[i].consume(&mut bucket) {
+                    indexes.push(i);
+                    continue 'next_bucket;
+                }
+            }
+            indexes.push(buckets.len());
+            buckets.push(bucket);
+        }
+        Self { indexes, buckets }
+    }
+}
+
+fn optimal_table(parent_buckets: &[Bucket], usable: Bits, index_bits: &[usize]) 
+    -> Option<Vec<(Bits, IndexedBuckets)>>
 {
     use std::io::Write;
-    eprintln!(""); // move cursor down one line
 
-    let mut combinations = usable.combinations(index_bits);
+    if index_bits.is_empty() {
+        return None;
+    }
+    
+    let combinations = usable.combinations(index_bits[0]);
     let num_combinations = combinations.len();
+    eprint!("\n\tProgress: 0/{num_combinations} (0.00%)");
 
     let mut min = (usize::MAX, None); // dummy value
     for (i, combo) in combinations.enumerate() {
-        let table = LookupTable::new(widths, chars, &combo);
-        let key = table.bucket_count();
-        if key < min.0 {
-            min = (key, Some((combo, table)))
+        let mut combo_buckets = Vec::new();
+        for pb in parent_buckets {
+            let mut buckets = make_buckets(pb, &combo);
+            combo_buckets.append(&mut buckets);
         }
-        if i % 64 == 0 {
+        let indexed = IndexedBuckets::from(combo_buckets);
+        if indexed.is_uniform() {
+            min = (0, Some(vec![(combo, indexed)]));
+            break;
+        }
+        if let Some(mut recurse) = optimal_table(indexed.buckets(), usable.without(&combo), &index_bits[1..]) {
+            recurse.push((combo, indexed));
+            let unique_buckets = recurse.iter().map(|(_, ib)| ib.buckets().len()).sum();
+            if unique_buckets < min.0 {
+                min = (unique_buckets, Some(recurse));
+            }
+        }
+        if i % 8 == 0 {
             let pcnt = (i as f64) / (num_combinations as f64) * 100.0f64;
-            eprint!("\r\tProgress: {i}/{num_combinations} ({pcnt:.2}%)");
-            std::io::stderr().flush();
+            eprint!("\r\tProgress: {i}/{num_combinations} ({pcnt:.2}%) \t(min: {})", min.0);
+            std::io::stderr().flush().unwrap();
         }
     }
 
-    eprint!("\x1BM"); // move cursor up one line
-    return min.1.unwrap();
+    eprint!("\x1B[1A"); // move cursor up one line
+    min.1
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn optimal(widths: *const u8, widths_len: usize) {
     let widths = std::slice::from_raw_parts(widths, widths_len);
-    let chars: Vec<_> = (0..u32::from(char::MAX)).filter_map(|c| char::try_from(c).ok()).collect();
-    let (bits, table) = optimal_lut(widths, &chars, Bits::from(0..UNICODE_BITS), 6);
-    eprintln!("OPTIMAL: {bits:?}, size {}", table.bucket_count());
+    let chars = Bucket::from_chars(
+        widths,
+        (0..u32::from(char::MAX)).filter_map(|c| char::try_from(c).ok())
+    );
+    let opt = optimal_table(&[chars], Bits::from(0..UNICODE_BITS), &[7,6,6]).unwrap();
+    eprintln!("Constructed {}-level lookup table:", opt.len());
+    for (bits, table) in opt.iter().rev() {
+        eprintln!("\tBits: {bits:?}, buckets: {}", table.buckets().len());
+    }
 }
