@@ -285,9 +285,54 @@ pub unsafe extern "C" fn optimal(widths: *const u8, widths_len: usize) {
         widths,
         (0..u32::from(char::MAX)).filter_map(|c| char::try_from(c).ok())
     );
+
+    let first_bits = Bits::from( 13..21 );
+    let second_bits = Bits::from( 6..13 );
+    let third_bits = Bits::from( 0..6 );
+    //let fourth_bits = Bits::from(0..7);
+    //assert!(first_bits.without(&second_bits).count() <= 8);
+
+    let first_buckets = make_buckets(&chars, &first_bits);
+    let first = IndexedBuckets::from(first_buckets);
+
+    eprintln!("First Size: {}", first.buckets().len());
+
+    let mut second_buckets = Vec::new();
+    for bucket in first.buckets().iter() {
+        let mut sub_buckets = make_buckets(&bucket, &second_bits);
+        second_buckets.append(&mut sub_buckets);
+    }
+    let second = IndexedBuckets::from(second_buckets);
+
+    eprintln!("Second Size: {}", second.buckets().len());
+
+    let mut third_buckets = Vec::new();
+    for bucket in second.buckets().iter() {
+        let mut sub_buckets = make_buckets(&bucket, &third_bits);
+        third_buckets.append(&mut sub_buckets);
+    }
+    let third = IndexedBuckets::from(third_buckets);
+
+    eprintln!("Third Size: {}", third.buckets().len());
+    /* 
+    let mut fourth_buckets = Vec::new();
+    for bucket in third.buckets().iter() {
+        let mut sub_buckets = make_buckets(&bucket, &fourth_bits);
+        fourth_buckets.append(&mut sub_buckets);
+    }
+    let fourth = IndexedBuckets::from(fourth_buckets);
+
+    eprintln!("Fourth Size: {}", fourth.buckets().len());
+    
     let opt = optimal_table(&[chars], Bits::from(0..UNICODE_BITS), &[6,7,8], 1).unwrap();
     eprintln!("Constructed {}-level lookup table:", opt.len());
     for (bits, table) in opt.iter().rev() {
         eprintln!("\tBits: {bits:?}, buckets: {}", table.buckets().len());
-    }
+    }*/
+
+    let total_size = (1 << first_bits.count()) 
+                    + first.buckets().len() * (1 << second_bits.count())
+                    + second.buckets().len() * (1 << (third_bits.count() - 2));
+
+    eprintln!("TOTAL SIZE: {total_size}");
 }
