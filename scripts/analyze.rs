@@ -54,6 +54,16 @@ impl Bits {
         } 
         result
     }  
+    /// Returns the number of discontinuities in the selected bits.
+    fn discontinuities(&self) -> usize {
+        let mut discontinuities = 0;
+        for i in 1..self.indices.len() {
+            if self.indices[i] > self.indices[i-1] + 1 {
+                discontinuities += 1;
+            }
+        }
+        discontinuities
+    }
 }
 impl<T: IntoIterator<Item = u8>> From<T> for Bits {
     fn from(input: T) -> Self {
@@ -212,7 +222,12 @@ impl<T: IntoIterator<Item = Bucket>> From<T> for IndexedBuckets {
     }
 }
 
-fn optimal_table(parent_buckets: &[Bucket], usable: Bits, index_bits: &[usize]) 
+fn optimal_table(
+    parent_buckets: &[Bucket], 
+    usable: Bits, 
+    index_bits: &[usize], 
+    max_discontinuities: usize 
+) 
     -> Option<Vec<(Bits, IndexedBuckets)>>
 {
     use std::io::Write;
@@ -227,6 +242,9 @@ fn optimal_table(parent_buckets: &[Bucket], usable: Bits, index_bits: &[usize])
 
     let mut min = (usize::MAX, None); // dummy value
     for (i, combo) in combinations.enumerate() {
+        if combo.discontinuities() > max_discontinuities {
+            continue;
+        }
         let mut combo_buckets = Vec::new();
         for pb in parent_buckets {
             let mut buckets = make_buckets(pb, &combo);
@@ -237,7 +255,12 @@ fn optimal_table(parent_buckets: &[Bucket], usable: Bits, index_bits: &[usize])
             min = (0, Some(vec![(combo, indexed)]));
             break;
         }
-        if let Some(mut recurse) = optimal_table(indexed.buckets(), usable.without(&combo), &index_bits[1..]) {
+        if let Some(mut recurse) = optimal_table(
+            indexed.buckets(), 
+            usable.without(&combo), 
+            &index_bits[1..],
+            max_discontinuities
+        ) {
             recurse.push((combo, indexed));
             let unique_buckets = recurse.iter().map(|(_, ib)| ib.buckets().len()).sum();
             if unique_buckets < min.0 {
@@ -262,7 +285,7 @@ pub unsafe extern "C" fn optimal(widths: *const u8, widths_len: usize) {
         widths,
         (0..u32::from(char::MAX)).filter_map(|c| char::try_from(c).ok())
     );
-    let opt = optimal_table(&[chars], Bits::from(0..UNICODE_BITS), &[7,6,6]).unwrap();
+    let opt = optimal_table(&[chars], Bits::from(0..UNICODE_BITS), &[6,7,8], 1).unwrap();
     eprintln!("Constructed {}-level lookup table:", opt.len());
     for (bits, table) in opt.iter().rev() {
         eprintln!("\tBits: {bits:?}, buckets: {}", table.buckets().len());
