@@ -19,9 +19,7 @@
 # out-of-line and check the generated module into git.
 
 from functools import reduce
-from itertools import combinations
-from subprocess import run
-import re, os, sys, enum, math, ctypes
+import re, os, sys, enum, math, operator, typing
 
 
 NUM_CODEPOINTS = 0x110000
@@ -29,23 +27,6 @@ NUM_CODEPOINTS = 0x110000
 
 NUM_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
 """ The maximum number of bits required to represent a Unicode codepoint."""
-
-KEYS_PER_NODE = 16
-""" The number of keys in each node. 
-    Note that each node has (KEYS_PER_NODE + 1) children, except for data (leaf) nodes. """
-
-NODE_ALIGNMENT = 64
-""" The alignment of each node, in bytes.
-    Ideally, this should be kept in sync with `#[repr(align(N))]` in `search.rs`, but it only 
-    affects the size estimation this script prints to the console. """
-
-KEY_SIZE = 4
-""" The size of each key, in bytes.
-    Ideally, this should be kept in sync with `search.rs`, but like `NODE_ALIGNMENT` it only
-    affects size estimation."""
-
-NUM_LUT_BITS = 6
-""" The number of bits used for indexing into the generated LUT. """
 
 def fetch_open(f):
     """ Opens `f` and return its corresponding file object. If `f` isn't present on disk, fetches  
@@ -57,7 +38,7 @@ def fetch_open(f):
     except OSError:
         sys.stderr.write(f"cannot load {f}")
         exit(1)
-    
+
 def load_unicode_version() -> "tuple[int, int, int]":
     """ Returns the current Unicode version by fetching and parsing `ReadMe.txt`. """
     with fetch_open("ReadMe.txt") as readme:
@@ -149,103 +130,54 @@ def load_zero_widths() -> "list[bool]":
 
         return zw_map
 
-class AnalysisResults(ctypes.Structure):
-    _fields_ = [("num_printable_ascii", ctypes.c_uint32), ("num_compressed", ctypes.c_uint32)]
-    def ascii_info(self) -> str:
-        total = 0x7F - 0x20
-        percent = 100.0 * self.num_printable_ascii / total
-        return f"{percent:.2f}% printable ASCII chars compressed ({self.num_printable_ascii}/{total})"
-    def total_info(self) -> str:
-        percent = 100.0 * self.num_compressed / NUM_CODEPOINTS
-        return f"{percent:.2f}% total codepoints compressed ({self.num_compressed}/{NUM_CODEPOINTS})"
+class Bucket:
+    def __init__(self):
+        self.cp_set = set()
+        self.widths = []
 
+    def append(self, codepoint: int, width: EffectiveWidth):
+        self.cp_set.add(codepoint)
+        self.widths.append(width)
 
-def analyze_lut(width_map: "list[EffectiveWidth]", bits: "list[int]"):
-    analysis_lut = [0] * len(width_map)
-    mask = reduce(lambda acc, bit : acc | (1 << bit), bits, 0)
-    for codepoint, width in enumerate(width_map):
-        analysis_lut[codepoint & mask] |= (1 << int(width))
-    # Observe that every successfully compressed block will have exactly one set bit (power of two)
-    is_power_two = lambda n : n != 0 and (n & (n-1) == 0)
-    return sum(1 for _ in filter(is_power_two, analysis_lut))
+    def try_extend(self, other: "Bucket") -> bool:
+        (sw, ow) = (self.widths, other.widths)
+        (less, more) = (sw, ow) if len(sw) <= len(ow) else (ow, sw)
+        if less != more[:len(less)]:
+            return False
+        self.cp_set |= other.cp_set
+        self.widths = more
+        return True
 
-def find_optimal_lut_bits(width_map: "list[EffectiveWidth]", num_bits: int) -> "tuple[int, list[int]]":
-    ALL_BITS = [i for i in range(0, NUM_CODEPOINT_BITS)]
-    rs_path = os.path.join(os.path.dirname(__file__), "analyze.rs")
-    base_cmd = f"rustc -O --crate-type cdylib --edition 2021 \"{rs_path}\""
-    # get the output library name, with extension, in a platform-agnostic fashion
-    lib_name = run(base_cmd + " --print file-names", text=True, capture_output=True).stdout.strip()
-    # actually compile the library
-    if run(base_cmd).returncode != 0:
-        sys.stderr.write(f"couldn't compile analysis library")
-        exit(1)
-    lib_path = os.path.join(os.getcwd(), lib_name)
-    lib = ctypes.CDLL(lib_path)
-    widths = (ctypes.c_uint8 * len(width_map))(*width_map)
-    lib.optimal(widths, len(width_map))
+    def codepoints(self) -> "list[int]":
+        result = list(self.cp_set)
+        result.sort()
+        return result
 
-def compress_widths(widths: "list[EffectiveWidth]") -> "list[tuple[int, EffectiveWidth]]":
-    """ Input: an array for which `widths[c]` is the computed width of codepoint `c`.
-        Output: `compressed`, a partition of the codespace into ranges of uniform effective width.
-        Each element in `compressed` is a codepoint-width tuple; the elements are sorted in 
-        increasing order of codepoint, and the width of element `i` applies to all codepoints from
-        `compressed[i][0]` to `compressed[i+1][0]` (exclusive), or to all codepoints greater than
-        `compressed[i][0]` if `compressed[i+1]` does not exist. """
-    assert len(widths) == NUM_CODEPOINTS
-    compressed = []
-    last_width = None
-    for codepoint, width in enumerate(widths):
-        if width != last_width:
-            last_width = width
-            compressed.append((codepoint, width))
-    
-    return compressed
+def make_buckets(
+        entries: "list[tuple[int, EffectiveWidth]]", 
+        right_shift: int, 
+        num_bits: int
+    ) -> "list[Bucket]":
+    buckets = [Bucket() for _ in range(0, 2**num_bits)]
+    mask = (1 << num_bits) - 1
+    for (codepoint, width) in entries:
+        buckets[ (codepoint >> right_shift) & mask ].append(codepoint, width)
+    return buckets
 
-def chunks(list, chunk_size, pad):
-    """ Returns an iterator over `list` which yields `chunk_size` slices of `list`, padding with 
-        `pad` if necessary. """
-    for i in range(0, len(list), chunk_size):
-        chunk = list[i:i+chunk_size]
-        yield chunk + ([pad] * (chunk_size - len(chunk)))
-
-def make_data_layer(compressed_widths: "list[tuple[int, EffectiveWidth]]"):
-    """ Converts `compressed_widths` to a list of nodes (each is a list of `KEYS_PER_NODE` tuples), 
-         sorted in descended order and padded as needed with `(0, EffectiveWidth.ZERO)`. """
-    descending = sorted(compressed_widths, reverse=True)
-    return list(chunks(descending, KEYS_PER_NODE, (0, EffectiveWidth.ZERO)))
-
-def make_search_layer(data_layer: "list[list[tuple[int, EffectiveWidth]]]", height: int):
-    """ Outputs a list `l` where `l[i][j]` is the minimum value of `data_layer[S*i + j]`, where 
-        `S = (KEYS_PER_NODE+1)**height`. If the last node in `l` is unfilled it is padded with 
-        `(0, EffectiveWidth.ZERO)`. Assumes that `data_layer` is sorted in descending order. """
-    keys = []
-    step = (KEYS_PER_NODE+1)**height
-    for chunk in chunks(data_layer, step, [(0, EffectiveWidth.ZERO)] * step):
-        keys.append(chunk[-1][-1])
-    # remove every (KEYS_PER_NODE + 1)th node
-    del keys[KEYS_PER_NODE::(KEYS_PER_NODE+1)]
-    return list(chunks(keys, KEYS_PER_NODE, (0, EffectiveWidth.ZERO)))
-
-def flatten_search_layers(search_layers: "list[list[tuple[int, EffectiveWidth]]]"):
-    """ Merges each element/layer in `search_layers` into a consecutive array `flattened`, sorted
-        in increasing order of layer size. Returns `(flattened, offsets)`, where `offsets[i]` is 
-        the start offset of layer `i` (zero-indexed). """
-    top_down = list(sorted(search_layers, key=lambda x : len(x)))
-    flattened = list(reduce(lambda x,y : x+y, top_down, []))
-    offsets = [0]
-    for layer in top_down:
-        offsets.append(offsets[-1] + len(layer))
-    offsets.pop() # remove the last offset, it's not needed
-    return (flattened, offsets)
-
-def node_to_string(node: "list[tuple[int, EffectiveWidth]]") -> str:
-    """ Outputs a string containing a Rust expression which constructs a `Node` from `node`. """
-    assert len(node) == KEYS_PER_NODE
-    out = "Node::new(["
-    for (codepoint, width) in node:
-        out += f"('\\u{{{codepoint:06X}}}', {int(width)}), "
-    out += "])"
-    return out 
+def index_buckets(buckets: "list[Bucket]") -> "tuple[list[int], list[Bucket]]":
+    indices = []
+    indexed = []
+    for bucket in buckets:
+        already_exists = False
+        for i in range(0, len(indexed)):
+            if indexed[i].try_extend(bucket):
+                already_exists = True
+                indices.append(i)
+                break
+        if not already_exists:
+            indices.append(len(indexed))
+            indexed.append(bucket)
+    return (indices, indexed)
 
 def emit_module(
         out_name: str, 
@@ -337,27 +269,31 @@ if __name__ == "__main__":
     for i in range(0x1160, 0x11FF + 1):
         width_map[i] = EffectiveWidth.ZERO
 
-    print(f"Building LUT using {NUM_LUT_BITS} bits. This will take a while...")
-    find_optimal_lut_bits(width_map, NUM_LUT_BITS)
+    def entries_representable(iterable, n: int):
+        """ Returns whether every entry in `iterable` is representable with `n` bits. 
+            Assumes all entries are unsigned integers. """
+        return max(iterable) < (1 << n)
+
+    # First lookup table is an array of u8 offsets, indexed by codepoint bits 13..NUM_CODEPOINT_BITS
+    buckets_0 = make_buckets(enumerate(width_map), 13, 8)
+    (indices_0, indexed_0) = index_buckets(buckets_0)
+    assert entries_representable(indices_0, 8)
+    print(f"Table 0: {len(indices_0)} bytes")
+
+    buckets_1 = []
+    for bucket in indexed_0:
+        buckets_1.extend(make_buckets(map(lambda i: (i, width_map[i]), bucket.codepoints()), 6, 7))
+    (indices_1, indexed_1) = index_buckets(buckets_1)
+    assert entries_representable(indices_1, 8)
+    print(f"Table 1: {len(indices_1)} bytes (= {len(indexed_0)} * {1 << 7})")
+
+    buckets_2 = []
+    for bucket in indexed_1:
+        buckets_2.extend(make_buckets(map(lambda i: (i, width_map[i]), bucket.codepoints()), 0, 6))
+    (indices_2, indexed_2) = index_buckets(buckets_2)
+    assert len(indexed_2) == 4
+    print(f"Table 2: {len(indices_2) >> 2} bytes (= {len(indexed_1)} * {1 << 4})")
+
+    # Second lookup table is an array of u8 offsets, indexed by codepoint bits 6..13
     
-
-    compressed_widths = compress_widths(width_map)
-    print(f"Compressed partition has {len(compressed_widths)} keys")
-
-    print("Building representation...")
-    data_layer = make_data_layer(compressed_widths)
-    print(f"\t{len(data_layer)} data nodes")
-
-    search_layers = []
-    while True:
-        search_layers.append(layer := make_search_layer(data_layer, len(search_layers)))
-        print(f"\t{len(layer)} search node(s)")
-        if len(layer) <= 1:
-            break
-
-    (flattened, offsets) = flatten_search_layers(search_layers)
-    node_size = int((KEYS_PER_NODE * KEY_SIZE + NODE_ALIGNMENT - 1) / NODE_ALIGNMENT) * NODE_ALIGNMENT
-    approx_memory = (len(flattened) + len(data_layer)) * node_size
-    print(f"Representation size: {approx_memory} bytes")
-
-    emit_module("generated.rs", version, data_layer, flattened, offsets)
+    # emit_module("generated.rs", version, data_layer, flattened, offsets)
