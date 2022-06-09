@@ -52,7 +52,7 @@ MODULE_FILENAME = "tables.rs"
 """ The filename of the output Rust module (will be created in the working directory) """
 
 Codepoint = int
-BitIndex = int
+BitPos = int
 
 def fetch_open(f: str):
     """ Opens `f` and return its corresponding file object. If `f` isn't present on disk, fetches  
@@ -160,20 +160,28 @@ def load_zero_widths() -> "list[bool]":
         return zw_map
 
 class Bucket:
+    """ A bucket contains a group of codepoints and an ordered width list. If one bucket's width 
+        list overlaps with another's width list, those buckets can be merged via `try_extend`. """
+
     def __init__(self):
+        """ Creates an empty bucket. """
         self.entry_set = set()
         self.widths = []
 
     def append(self, codepoint: Codepoint, width: EffectiveWidth):
+        """ Adds a codepoint/width pair to the bucket, and appends `width` to the width list. """
         self.entry_set.add( (codepoint, width) )
         self.widths.append(width)
 
-    def try_extend(self, other: "Bucket") -> bool:
-        (sw, ow) = (self.widths, other.widths)
-        (less, more) = (sw, ow) if len(sw) <= len(ow) else (ow, sw)
+    def try_extend(self, attempt: "Bucket") -> bool:
+        """ If either `self` or `attempt`'s width list starts with the other bucket's width list,
+            set `self`'s width list to the longer of the two, add all of `attempt`'s codepoints 
+            into `self`, and return `True`. Otherwise, return `False`. """
+        (sw, aw) = (self.widths, attempt.widths)
+        (less, more) = (sw, aw) if len(sw) <= len(aw) else (aw, sw)
         if less != more[:len(less)]:
             return False
-        self.entry_set |= other.entry_set
+        self.entry_set |= attempt.entry_set
         self.widths = more
         return True
 
@@ -194,7 +202,11 @@ class Bucket:
                 return
         return potential_width
 
-def make_buckets(entries, low_bit: BitIndex, num_bits: BitIndex) -> "list[Bucket]":
+def make_buckets(entries, low_bit: BitPos, cap_bit: BitPos) -> "list[Bucket]":
+    """ Partitions the `(Codepoint, EffectiveWidth)` tuples in `entries` into `Bucket`s. All
+        codepoints with identical bits from `low_bit` to `cap_bit` (exclusive) are placed in the
+        same bucket. Returns a list of the buckets in increasing order of those bits."""
+    num_bits = cap_bit - low_bit
     assert num_bits > 0
     buckets = [Bucket() for _ in range(0, 2**num_bits)]
     mask = (1 << num_bits) - 1
@@ -202,67 +214,76 @@ def make_buckets(entries, low_bit: BitIndex, num_bits: BitIndex) -> "list[Bucket
         buckets[ (codepoint >> low_bit) & mask ].append(codepoint, width)
     return buckets
 
-def index_buckets(buckets) -> "tuple[list[Codepoint], list[Bucket]]":
-    indices = []
-    indexed = []
-    for bucket in buckets:
-        already_exists = False
-        for i in range(0, len(indexed)):
-            if indexed[i].try_extend(bucket):
-                already_exists = True
-                indices.append(i)
-                break
-        if not already_exists:
-            indices.append(len(indexed))
-            indexed.append(bucket)
-    return (indices, indexed)
-
 class Table:
-    def __init__(self, entry_groups, low_bit: BitIndex, cap_bit: BitIndex, offset_type: OffsetType):
+    """ Represents a lookup table. Each table contains a certain number of subtables; each
+        subtable is indexed by a contiguous bit range of the codepoint and contains a list
+        of `2**(number of bits in bit range)` entries.
+        
+        Typically, tables contain a list of buckets of codepoints. Bucket `i`'s codepoints should
+        be indexed by sub-table `i` in the following lookup table. The entries of this table are
+        indexes into the bucket list (~= indexes into the sub-tables of the following table.) The
+        key to compression is that two different buckets in two different sub-tables may have the
+        same width list, which means that they can be merged into the same bucket.
+
+        If every bucket's codepoints have uniform width, calling `indices_to_widths` will discard 
+        the buckets and convert the entries into `EffectiveWidth` values. """
+        
+    def __init__(self, entry_groups, low_bit: BitPos, cap_bit: BitPos, offset_type: OffsetType):
+        """ Create a lookup table with a sub-table for each `(Codepoint, EffectiveWidth)` iterator
+            in `entry_groups`. Each sub-table is indexed by codepoint bits in `low_bit..cap_bit`,
+            and each table entry is represented in the format specified by  `offset_type`. Asserts
+            that this table is actually representable with `offset_type`. """
         self.low_bit = low_bit
-        self.num_bits = cap_bit - low_bit
+        self.cap_bit = cap_bit
         self.offset_type = offset_type
-        self.indices = []
+        self.entries = []
         self.indexed = []
 
         buckets = []
         for entries in entry_groups:
-            buckets.extend(make_buckets(entries, self.low_bit, self.num_bits))
+            buckets.extend(make_buckets(entries, self.low_bit, self.cap_bit))
 
         for bucket in buckets:
             for (i, existing) in enumerate(self.indexed):
                 if existing.try_extend(bucket):
-                    self.indices.append(i)
+                    self.entries.append(i)
                     break
             else:
-                self.indices.append(len(self.indexed))
+                self.entries.append(len(self.indexed))
                 self.indexed.append(bucket)
 
         # Validate offset type
-        for index in self.indices:
+        for index in self.entries:
             assert index < (1 << int(self.offset_type))
 
     def indices_to_widths(self):
         """ Destructively converts the indices in this table to the `EffectiveWidth` values of  
             their buckets. Assumes that no bucket includes codepoints with different widths. """
-        self.indices = list(map(lambda i: int(self.indexed[i].width()), self.indices))
+        self.entries = list(map(lambda i: int(self.indexed[i].width()), self.entries))
         del self.indexed
 
     def buckets(self):
         """ Returns an iterator over this table's buckets. """
         return self.indexed
 
-    def byte_array(self) -> "list[int]":
-        indices_per_byte = 8 // int(self.offset_type)
+    def to_bytes(self) -> "list[int]":
+        """ Returns this table's entries as a list of bytes. The bytes are formatted according to
+            the `OffsetType` which the table was created with. For example, with `OffsetType.U2`,
+            each byte will contain four packed 2-bit entries. """
+        entries_per_byte = 8 // int(self.offset_type)
         byte_array = []
-        for i in range(0,len(self.indices),indices_per_byte):
+        for i in range(0,len(self.entries),entries_per_byte):
             byte = 0
-            for j in range(0,indices_per_byte):
-                byte |= self.indices[i+j] << (j*int(self.offset_type))
+            for j in range(0,entries_per_byte):
+                byte |= self.entries[i+j] << (j*int(self.offset_type))
             byte_array.append(byte)
         return byte_array
         
-def make_tables(table_cfgs: "list[tuple[BitIndex, BitIndex, OffsetType]]", entries) -> "list[Table]":
+def make_tables(table_cfgs: "list[tuple[BitPos, BitPos, OffsetType]]", entries) -> "list[Table]":
+    """ Creates a table for each configuration in `table_cfgs`, with the first config corresponding
+        to the top-level lookup table, the second config corresponding to the second-level lookup
+        table, and so forth. `entries` is an iterator over the `(Codepoint, EffectiveWidth)` pairs
+        to include in the top-level table. """
     tables = []
     entry_groups = [ entries ]
     for (low_bit, cap_bit, offset_type) in table_cfgs:
@@ -271,10 +292,8 @@ def make_tables(table_cfgs: "list[tuple[BitIndex, BitIndex, OffsetType]]", entri
         tables.append(table)
     return tables
 
-def emit_module(out_name: str, unicode_version: "tuple[int, int, int]", tables):
-    """ Outputs a Rust module to `out_name` with the following constants: 
-        - `UNICODE_VERSION: (u8, u8, u8)`, corresponds to `unicode_version`. 
-        - `TABLE_{i}: [u8; ...]`, corresponds to `tables[i]` for all valid `i` """
+def emit_module(out_name: str, unicode_version: "tuple[int, int, int]", tables: "list[Table]"):
+    """ Outputs a Rust module to `out_name`. """
     if os.path.exists(out_name):
         os.remove(out_name)
     with open(out_name, "w") as of:
@@ -376,12 +395,12 @@ pub mod charwidth {
             new_subtable_count = len(table.buckets())
             if i == len(tables) - 1:
                 table.indices_to_widths() # for the last table, indices == widths
-            byte_array = table.byte_array()
+            byte_array = table.to_bytes()
             of.write("""
     /// Autogenerated table with %s sub-table(s); consult [`lookup_width`] for indexing details.
     const TABLES_%s: [u8; %s] = [""" % (subtable_count, i, len(byte_array)))
             for (j, byte) in enumerate(byte_array):
-                # Add line breaks every 15th line (chosen to match what rustfmt does)
+                # Add line breaks for every 15th entry (chosen to match what rustfmt does)
                 if j % 15 == 0:
                     of.write("\n       ")
                 of.write(f" 0x{byte:02X},")
@@ -413,7 +432,7 @@ if __name__ == "__main__":
     print("------------------------")
     total_size = 0
     for (i, table) in enumerate(tables):
-        size_bytes = len(table.byte_array())
+        size_bytes = len(table.to_bytes())
         print(f"Table {i} Size: {size_bytes} bytes")
         total_size += size_bytes
     print("------------------------")
