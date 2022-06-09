@@ -183,6 +183,17 @@ class Bucket:
         result.sort()
         return result
 
+    def width(self) -> "EffectiveWidth":
+        """ If all codepoints in this bucket have the same width, return that width;
+            otherwise, return `None`. """
+        if len(self.widths) == 0:
+            return
+        potential_width = self.widths[0]
+        for width in self.widths[1:]:
+            if potential_width != width:
+                return
+        return potential_width
+
 def make_buckets(entries, low_bit: BitIndex, num_bits: BitIndex) -> "list[Bucket]":
     assert num_bits > 0
     buckets = [Bucket() for _ in range(0, 2**num_bits)]
@@ -234,7 +245,7 @@ class Table:
     def indices_to_widths(self):
         """ Destructively converts the indices in this table to the `EffectiveWidth` values of  
             their buckets. Assumes that no bucket includes codepoints with different widths. """
-        self.indices = list(map(lambda i: self.indexed[i][0], self.indices))
+        self.indices = list(map(lambda i: int(self.indexed[i].width()), self.indices))
         del self.indexed
 
     def buckets(self):
@@ -335,7 +346,7 @@ pub mod charwidth {
 
         of.write("""
     /// Returns the [UAX #11](https://www.unicode.org/reports/tr11/) based width of `c`, or 
-    /// [None](core::option::None) if `c` is a control character other than `\0`. 
+    /// [None](core::option::None) if `c` is a control character other than `\\0`. 
     /// If `is_cjk == true`, ambiguous width characters are treated as double width; otherwise, 
     /// they're treated as single width.
     #[inline]
@@ -362,7 +373,8 @@ pub mod charwidth {
 
         subtable_count = 1
         for (i, table) in enumerate(tables):
-            if i == len(tables):
+            new_subtable_count = len(table.buckets())
+            if i == len(tables) - 1:
                 table.indices_to_widths() # for the last table, indices == widths
             byte_array = table.byte_array()
             of.write("""
@@ -373,7 +385,7 @@ pub mod charwidth {
                     of.write("\n\t\t")
                 of.write(f"0x{byte:02X}, ")
             of.write("\n\t];\n")
-            subtable_count = len(table.buckets())
+            subtable_count = new_subtable_count
         of.write("""
 }
 """)
