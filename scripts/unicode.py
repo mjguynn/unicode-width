@@ -23,6 +23,34 @@ import re, os, sys, enum, math
 NUM_CODEPOINTS = 0x110000
 """ An upper bound for which `range(0, NUM_CODEPOINTS)` contains Unicode's codespace. """
 
+MAX_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
+""" The maximum number of bits required to represent a Unicode codepoint."""
+
+class OffsetType(enum.IntEnum):
+    """ Represents the data type of a lookup table's offsets. Each variant's value represents the
+        number of bits required to represent that variant's type. """
+    U2 = 2
+    """ Offsets are 2-bit unsigned integers, packed four-per-byte. """
+    U4 = 4
+    """ Offsets are 4-bit unsigned integers, packed two-per-byte. """
+    U8 = 8
+    """ Each offset is a single byte (u8). """
+
+TABLE_CFGS = [
+    (13, MAX_CODEPOINT_BITS, OffsetType.U8),
+    (6, 13, OffsetType.U8),
+    (0, 6, OffsetType.U2)
+]
+""" Represents the format of each level of the multi-level lookup table. 
+    A level's entry is of the form `(low_bit, cap_bit, offset_type)`.
+    This means that every sub-table in that level is indexed by bits `low_bit..cap_bit` of the
+    codepoint and those tables offsets are stored according to `offset_type`.
+
+    If this is edited, you MUST edit the Rust code for `lookup_width` to reflect the changes! """
+
+MODULE_FILENAME = "tables.rs"
+""" The filename of the output Rust module (will be created in the working directory) """
+
 Codepoint = int
 BitIndex = int
 
@@ -178,16 +206,6 @@ def index_buckets(buckets) -> "tuple[list[Codepoint], list[Bucket]]":
             indexed.append(bucket)
     return (indices, indexed)
 
-class OffsetType(enum.Enum):
-    """ Represents the data type of a lookup table's offsets. The integer value assigned to each
-        variant represents the number of TODO"""
-    U2 = (2, 2)
-    """ Offsets are 2-bit unsigned integers, packed four-per-byte. """
-    U4 = (4, 1)
-    """ Offsets are 4-bit unsigned integers, packed two-per-byte. """
-    U8 = (8, 0)
-    """ Each offset is a single byte (u8). """
-
 class Table:
     def __init__(self, entry_groups, low_bit: BitIndex, cap_bit: BitIndex, offset_type: OffsetType):
         self.low_bit = low_bit
@@ -200,7 +218,6 @@ class Table:
         for entries in entry_groups:
             buckets.extend(make_buckets(entries, self.low_bit, self.num_bits))
 
-        # Index buckets
         for bucket in buckets:
             for (i, existing) in enumerate(self.indexed):
                 if existing.try_extend(bucket):
@@ -210,40 +227,38 @@ class Table:
                 self.indices.append(len(self.indexed))
                 self.indexed.append(bucket)
 
-        # Validate offset type -- then set it upon success
+        # Validate offset type
         for index in self.indices:
-            assert index < (1 << self.offset_type.value[0])
+            assert index < (1 << int(self.offset_type))
+
+    def indices_to_widths(self):
+        """ Destructively converts the indices in this table to the `EffectiveWidth` values of  
+            their buckets. Assumes that no bucket includes codepoints with different widths. """
+        self.indices = list(map(lambda i: self.indexed[i][0], self.indices))
+        del self.indexed
 
     def buckets(self):
+        """ Returns an iterator over this table's buckets. """
         return self.indexed
-        
-    def indexing_info(self):
-        byte_bits = self.offset_type.value[1]
-        byte_info = None
-        if byte_bits != 0:
-            emask = (1 << self.offset_type.value[1]) - 1
-            byte_info = (self.low_bit, (1 << byte_bits) - 1, self.offset_type.value[0], emask)
-        return (self.low_bit + byte_bits, (1 << (self.num_bits - byte_bits)) - 1, byte_info)
 
     def byte_array(self) -> "list[int]":
-        indices_per_byte = 8 // self.offset_type.value[0]
+        indices_per_byte = 8 // int(self.offset_type)
         byte_array = []
         for i in range(0,len(self.indices),indices_per_byte):
             byte = 0
             for j in range(0,indices_per_byte):
-                byte |= self.indices[i+j] << (j*self.offset_type.value[0])
+                byte |= self.indices[i+j] << (j*int(self.offset_type))
             byte_array.append(byte)
         return byte_array
-
         
 def make_tables(table_cfgs: "list[tuple[BitIndex, BitIndex, OffsetType]]", entries) -> "list[Table]":
-    output = []
+    tables = []
     entry_groups = [ entries ]
     for (low_bit, cap_bit, offset_type) in table_cfgs:
         table = Table(entry_groups, low_bit, cap_bit, offset_type)
         entry_groups = map(lambda bucket: bucket.entries(), table.buckets())
-        output.append(table)
-    return output
+        tables.append(table)
+    return tables
 
 def emit_module(out_name: str, unicode_version: "tuple[int, int, int]", tables):
     """ Outputs a Rust module to `out_name` with the following constants: 
@@ -274,40 +289,56 @@ pub const UNICODE_VERSION: (u8, u8, u8) = (%s, %s, %s);
 pub mod charwidth {
     use core::option::Option::{self, None, Some};
 
+    /// Returns the [UAX #11](https://www.unicode.org/reports/tr11/) based width of `c` by 
+    /// consulting a multi-level lookup table. 
+    /// If `is_cjk == true`, ambiguous width characters are treated as double width; otherwise, 
+    /// they're treated as single width.
+    ///
+    /// # Maintenance
+    /// The tables themselves are autogenerated but this function is hardcoded. You should have 
+    /// nothing to worry about when re-running `unicode.py`, such as when updating Unicode.
+    /// However, if you change the *actual structure* of the lookup tables (perhaps by editing the 
+    /// `TABLE_CFGS` global in `unicode.py`) you must ensure this code reflects those changes.
     #[inline]
     fn lookup_width(c: char, is_cjk: bool) -> usize {
         let cp = c as usize;
 
-""")
+        let t1_offset = TABLES_0[cp >> 13 & 0xFF];
 
-        mul_var = 1
-        index_var = 0
-        for (i, table) in enumerate(tables):
-            (lrs, mask, byte_indexing_info) = table.indexing_info()
-            table_index = f"{mul_var} * ({index_var} as usize) + ( cp >> {lrs} & 0x{mask:0X} )"
-            byte_index = ""
-            if byte_indexing_info:
-                (blrs, bmask, bmul, emask) = byte_indexing_info
-                byte_index = f" >> ({bmul} * (cp >> {blrs} & 0x{bmask:0X})) & 0x{emask:0X}"
-            of.write(f"\t\tlet i{i} = TABLE_{i}[{table_index}]{byte_index};\n")
-            mul_var = len(table.buckets())
-            index_var = f"i{i}"
+        // Each sub-table in TABLES_1 is 7 bits, and each stored offset is a byte, 
+        // so each sub-table is 128 bytes in size.
+        // (Sub-tables are selected using the computed offset from the previous table.)
+        let t2_offset = TABLES_1[128 * usize::from(t1_offset) + (cp >> 6 & 0x7F)];
 
-        of.write("""
-        if %s == 3 {
-            if is_cjk { 
-                2 
-            } else { 
-                1 
+        // Each sub-table in TABLES_2 is 6 bits, but each stored offset is 2 bits.
+        // This is accomplished by packing four stored offsets into one byte.
+        // So really, each sub-table is (6-2) bits in size (16 bytes)
+        // Also, since this is the last table, the "offsets" are actually encoded widths.
+        let packed_widths = TABLES_2[16 * usize::from(t2_offset) + (cp >> 2 & 0xF)];
+
+        // Extract the packed width from TABLES_2
+        let width = packed_widths >> (2 * (cp & 0b11)) & 0b11;
+
+        // Character widths are directly encoded into the offsets of the final table,
+        // except 3 means ambiguous width.
+        if width == 3 {
+            if is_cjk {
+                2
+            } else {
+                1
             }
-        } else {
-            %s.into()
         }
-    }
-    """ % (index_var, index_var))
+        else {
+            width.into()
+        }
+    }""")
 
         of.write("""
-    #[inline(always)]
+    /// Returns the [UAX #11](https://www.unicode.org/reports/tr11/) based width of `c`, or 
+    /// [None](core::option::None) if `c` is a control character other than `\0`. 
+    /// If `is_cjk == true`, ambiguous width characters are treated as double width; otherwise, 
+    /// they're treated as single width.
+    #[inline]
     pub fn width(c: char, is_cjk: bool) -> Option<usize> {
         if c < '\\u{7F}' {
             if c >= '\\u{20}' {
@@ -329,16 +360,20 @@ pub mod charwidth {
     }
     """)
 
+        subtable_count = 1
         for (i, table) in enumerate(tables):
+            if i == len(tables):
+                table.indices_to_widths() # for the last table, indices == widths
             byte_array = table.byte_array()
             of.write("""
-    /// (todo)
-    const TABLE_%s: [u8; %s] = [""" % (i, len(byte_array)))
+    /// Autogenerated table with %s sub-table(s); consult [`lookup_width`] for indexing details.
+    const TABLES_%s: [u8; %s] = [""" % (subtable_count, i, len(byte_array)))
             for (j, byte) in enumerate(byte_array):
                 if j % 12 == 0:
                     of.write("\n\t\t")
                 of.write(f"0x{byte:02X}, ")
             of.write("\n\t];\n")
+            subtable_count = len(table.buckets())
         of.write("""
 }
 """)
@@ -362,12 +397,6 @@ if __name__ == "__main__":
     for i in range(0x1160, 0x11FF + 1):
         width_map[i] = EffectiveWidth.ZERO
 
-    MAX_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
-    TABLE_CFGS = [
-        (13, MAX_CODEPOINT_BITS, OffsetType.U8),
-        (6, 13, OffsetType.U8),
-        (0, 6, OffsetType.U2)
-    ]
     tables = make_tables(TABLE_CFGS, enumerate(width_map))
 
     print("------------------------")
@@ -379,5 +408,4 @@ if __name__ == "__main__":
     print("------------------------")
     print(f"  Total Size: {total_size} bytes")
 
-    OUT_NAME = "tables.rs"
-    emit_module(OUT_NAME, version, tables)
+    emit_module(MODULE_FILENAME, version, tables)
