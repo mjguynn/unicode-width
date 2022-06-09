@@ -18,17 +18,18 @@
 # Since this should not require frequent updates, we just store this
 # out-of-line and check the generated module into git.
 
-from functools import reduce
-import re, os, sys, enum, math, operator, typing
-
+import re, os, sys, enum, math
 
 NUM_CODEPOINTS = 0x110000
-""" An upper bound for which `range(0, NUM_CODEPOINTS)` contains the entire Unicode codespace. """
+""" An upper bound for which `range(0, NUM_CODEPOINTS)` contains Unicode's codespace. """
 
 NUM_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
-""" The maximum number of bits required to represent a Unicode codepoint."""
+""" The maximum number of bits required to represent a Unicode codepoint. """
 
-def fetch_open(f):
+Codepoint = int
+BitIndex = int
+
+def fetch_open(f: str):
     """ Opens `f` and return its corresponding file object. If `f` isn't present on disk, fetches  
         it from `http://www.unicode.org/Public/UNIDATA/`. Exits with code 1 on failure. """
     if not os.path.exists(os.path.basename(f)):
@@ -46,8 +47,8 @@ def load_unicode_version() -> "tuple[int, int, int]":
         return tuple(map(int, re.search(pattern, readme.read()).groups()))
 
 class EffectiveWidth(enum.IntEnum):
-    """ For our purposes, we only care about the following character widths. All East Asian Width
-        classes resolve into either `NARROW`, `WIDE`, or `AMBIGUOUS`. """
+    """ For our purposes, we only care about the following character widths. 
+        All East Asian Width classes resolve into either `NARROW`, `WIDE`, or `AMBIGUOUS`. """
     ZERO = 0
     """ Zero columns wide. """
     NARROW = 1
@@ -79,7 +80,7 @@ def load_east_asian_widths() -> "list[EffectiveWidth]":
         width_map = []
         current = 0
         for line in eaw.readlines():
-            raw_data = () # (low, high, width)
+            raw_data = None # (low, high, width)
             if m := single.match(line):
                 raw_data = (m.group(1), m.group(1), m.group(2))
             elif m := multiple.match(line):
@@ -104,7 +105,7 @@ def load_east_asian_widths() -> "list[EffectiveWidth]":
         return width_map
 
 def load_zero_widths() -> "list[bool]":
-    """ Returns a list `l` where `l[c]` is true iff codepoint `c` is considered a zero-width 
+    """ Returns a list `l` where `l[c]` is true if codepoint `c` is considered a zero-width 
         character. `c` is considered a zero-width character if `c` is in general categories
          `Cc`, `Cf`, `Mn`, or `Me` (determined by fetching and parsing `UnicodeData.txt`). """
     with fetch_open("UnicodeData.txt") as categories:
@@ -119,13 +120,16 @@ def load_zero_widths() -> "list[bool]":
             assert current <= codepoint
             while current <= codepoint:
                 if name.endswith(", Last>") or current == codepoint:
-                    zw_map.append(zw) # the specified char, or filling in a range
+                    # if name ends with Last, we backfill the width value to all codepoints since
+                    # the previous codepoint (aka the start of the range)
+                    zw_map.append(zw)
                 else:
-                    zw_map.append(False) # unassigned characters have non-zero-width
+                    # unassigned characters are implicitly given Neutral width, which is nonzero
+                    zw_map.append(False)
                 current += 1
 
         while len(zw_map) < NUM_CODEPOINTS:
-            # Catch any leftover codepoints. They must be unassigned
+            # Catch any leftover codepoints. They must be unassigned (so nonzero width)
             zw_map.append(False)
 
         return zw_map
@@ -135,7 +139,7 @@ class Bucket:
         self.cp_set = set()
         self.widths = []
 
-    def append(self, codepoint: int, width: EffectiveWidth):
+    def append(self, codepoint: Codepoint, width: EffectiveWidth):
         self.cp_set.add(codepoint)
         self.widths.append(width)
 
@@ -148,23 +152,27 @@ class Bucket:
         self.widths = more
         return True
 
-    def codepoints(self) -> "list[int]":
+    def codepoints(self) -> "list[Codepoint]":
+        """ Return a sorted list of the codepoints in this bucket. """
         result = list(self.cp_set)
         result.sort()
         return result
 
 def make_buckets(
-        entries: "list[tuple[int, EffectiveWidth]]", 
-        right_shift: int, 
-        num_bits: int
+        codepoints,
+        width_map: "list[EffectiveWidth]",
+        low_bit: BitIndex, 
+        sentinel_bit: BitIndex
     ) -> "list[Bucket]":
+    num_bits = sentinel_bit - low_bit
+    assert num_bits > 0
     buckets = [Bucket() for _ in range(0, 2**num_bits)]
     mask = (1 << num_bits) - 1
-    for (codepoint, width) in entries:
-        buckets[ (codepoint >> right_shift) & mask ].append(codepoint, width)
+    for codepoint in codepoints:
+        buckets[ (codepoint >> low_bit) & mask ].append(codepoint, width_map[codepoint])
     return buckets
 
-def index_buckets(buckets: "list[Bucket]") -> "tuple[list[int], list[Bucket]]":
+def index_buckets(buckets: "list[Bucket]") -> "tuple[list[Codepoint], list[Bucket]]":
     indices = []
     indexed = []
     for bucket in buckets:
@@ -178,6 +186,31 @@ def index_buckets(buckets: "list[Bucket]") -> "tuple[list[int], list[Bucket]]":
             indices.append(len(indexed))
             indexed.append(bucket)
     return (indices, indexed)
+
+class OffsetType(enum.IntEnum):
+    """ Represents the data type of a lookup table's offsets. """
+    U2 = 2,
+    """ Offsets are 2-bit unsigned integers, packed four-per-byte. """
+    U4 = 4,
+    """ Offsets are 4-bit unsigned integers, packed two-per-byte. """
+    U8 = 8
+    """ Each offset is a single byte (u8). """
+
+def make_tables(
+        table_cfgs: "list[tuple[OffsetType, BitIndex, BitIndex]]", 
+        codepoints,
+        width_map: "list[EffectiveWidth]"
+    ):
+    output = []
+    cp_groups = [ range(0, NUM_CODEPOINTS) ]
+    for (offset_type, low_bit, sentinel_bit) in table_cfgs:
+        table_buckets = []
+        for g in cp_groups:
+            table_buckets.extend(make_buckets(g, width_map, low_bit, sentinel_bit))
+        (indices, indexed) = index_buckets(table_buckets)
+        cp_groups = [ bucket.codepoints() for bucket in indexed]
+        output.append( (indices, offset_type) )
+    return output
 
 def emit_module(
         out_name: str, 
@@ -269,31 +302,14 @@ if __name__ == "__main__":
     for i in range(0x1160, 0x11FF + 1):
         width_map[i] = EffectiveWidth.ZERO
 
-    def entries_representable(iterable, n: int):
-        """ Returns whether every entry in `iterable` is representable with `n` bits. 
-            Assumes all entries are unsigned integers. """
-        return max(iterable) < (1 << n)
+    TABLE_CFGS = [
+        (OffsetType.U8, 13, NUM_CODEPOINT_BITS),
+        (OffsetType.U8, 6, 13),
+        (OffsetType.U2, 0, 6)
+    ]
 
-    # First lookup table is an array of u8 offsets, indexed by codepoint bits 13..NUM_CODEPOINT_BITS
-    buckets_0 = make_buckets(enumerate(width_map), 13, 8)
-    (indices_0, indexed_0) = index_buckets(buckets_0)
-    assert entries_representable(indices_0, 8)
-    print(f"Table 0: {len(indices_0)} bytes")
-
-    buckets_1 = []
-    for bucket in indexed_0:
-        buckets_1.extend(make_buckets(map(lambda i: (i, width_map[i]), bucket.codepoints()), 6, 7))
-    (indices_1, indexed_1) = index_buckets(buckets_1)
-    assert entries_representable(indices_1, 8)
-    print(f"Table 1: {len(indices_1)} bytes (= {len(indexed_0)} * {1 << 7})")
-
-    buckets_2 = []
-    for bucket in indexed_1:
-        buckets_2.extend(make_buckets(map(lambda i: (i, width_map[i]), bucket.codepoints()), 0, 6))
-    (indices_2, indexed_2) = index_buckets(buckets_2)
-    assert len(indexed_2) == 4
-    print(f"Table 2: {len(indices_2) >> 2} bytes (= {len(indexed_1)} * {1 << 4})")
-
-    # Second lookup table is an array of u8 offsets, indexed by codepoint bits 6..13
+    tables = make_tables(TABLE_CFGS, range(0, len(width_map)), width_map)
+    for table in tables:
+        print(f"Table: {math.ceil(len(table[0]) * int(table[1]) / 8)} ")
     
     # emit_module("generated.rs", version, data_layer, flattened, offsets)
