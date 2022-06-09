@@ -342,7 +342,8 @@ pub mod charwidth {
         else {
             width.into()
         }
-    }""")
+    }
+    """)
 
         of.write("""
     /// Returns the [UAX #11](https://www.unicode.org/reports/tr11/) based width of `c`, or 

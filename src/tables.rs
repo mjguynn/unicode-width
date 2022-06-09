@@ -60,6 +60,7 @@ pub mod charwidth {
             width.into()
         }
     }
+    
     /// Returns the [UAX #11](https://www.unicode.org/reports/tr11/) based width of `c`, or 
     /// [None](core::option::None) if `c` is a control character other than `\0`. 
     /// If `is_cjk == true`, ambiguous width characters are treated as double width; otherwise, 
