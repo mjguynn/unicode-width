@@ -136,11 +136,11 @@ def load_zero_widths() -> "list[bool]":
 
 class Bucket:
     def __init__(self):
-        self.cp_set = set()
+        self.entry_set = set()
         self.widths = []
 
     def append(self, codepoint: Codepoint, width: EffectiveWidth):
-        self.cp_set.add(codepoint)
+        self.entry_set.add( (codepoint, width) )
         self.widths.append(width)
 
     def try_extend(self, other: "Bucket") -> bool:
@@ -148,31 +148,26 @@ class Bucket:
         (less, more) = (sw, ow) if len(sw) <= len(ow) else (ow, sw)
         if less != more[:len(less)]:
             return False
-        self.cp_set |= other.cp_set
+        self.entry_set |= other.entry_set
         self.widths = more
         return True
 
-    def codepoints(self) -> "list[Codepoint]":
-        """ Return a sorted list of the codepoints in this bucket. """
-        result = list(self.cp_set)
+    def entries(self) -> "list[tuple[Codepoint, EffectiveWidth]]":
+        """ Return a sorted list of the codepoint/width pairs in this bucket. """
+        result = list(self.entry_set)
         result.sort()
         return result
 
-def make_buckets(
-        codepoints,
-        width_map: "list[EffectiveWidth]",
-        low_bit: BitIndex, 
-        sentinel_bit: BitIndex
-    ) -> "list[Bucket]":
-    num_bits = sentinel_bit - low_bit
+def make_buckets(entries, low_bit: BitIndex, cap_bit: BitIndex) -> "list[Bucket]":
+    num_bits = cap_bit - low_bit
     assert num_bits > 0
     buckets = [Bucket() for _ in range(0, 2**num_bits)]
     mask = (1 << num_bits) - 1
-    for codepoint in codepoints:
-        buckets[ (codepoint >> low_bit) & mask ].append(codepoint, width_map[codepoint])
+    for (codepoint, width) in entries:
+        buckets[ (codepoint >> low_bit) & mask ].append(codepoint, width)
     return buckets
 
-def index_buckets(buckets: "list[Bucket]") -> "tuple[list[Codepoint], list[Bucket]]":
+def index_buckets(buckets) -> "tuple[list[Codepoint], list[Bucket]]":
     indices = []
     indexed = []
     for bucket in buckets:
@@ -196,33 +191,52 @@ class OffsetType(enum.IntEnum):
     U8 = 8
     """ Each offset is a single byte (u8). """
 
-def make_tables(
-        table_cfgs: "list[tuple[OffsetType, BitIndex, BitIndex]]", 
-        codepoints,
-        width_map: "list[EffectiveWidth]"
-    ):
+class Table:
+    def __init__(self, entry_groups, low_bit: BitIndex, cap_bit: BitIndex, offset_type: OffsetType):
+        self.low_bit = low_bit
+        self.cap_bit = cap_bit
+        self.offset_type = offset_type
+        self.indices = []
+        self.indexed = []
+
+        buckets = []
+        for entries in entry_groups:
+            buckets.extend(make_buckets(entries, low_bit, cap_bit))
+
+        # Index buckets
+        for bucket in buckets:
+            for (i, existing) in enumerate(self.indexed):
+                if existing.try_extend(bucket):
+                    self.indices.append(i)
+                    break
+            else:
+                self.indices.append(len(self.indexed))
+                self.indexed.append(bucket)
+
+        # Validate offset type -- then set it upon success
+        for index in self.indices:
+            assert index < (1 << int(self.offset_type))
+
+    def entry_groups(self):
+        return map(lambda bucket: bucket.entries(), self.indexed)
+        
+    def size_bytes(self) -> int:
+        """ Returns the size of this table's data in bytes. Doesn't account for padding. """
+        return len(self.indices) * int(self.offset_type) // 8
+        
+def make_tables(table_cfgs: "list[tuple[BitIndex, BitIndex, OffsetType]]", entries) -> "list[Table]":
     output = []
-    cp_groups = [ range(0, NUM_CODEPOINTS) ]
-    for (offset_type, low_bit, sentinel_bit) in table_cfgs:
-        table_buckets = []
-        for g in cp_groups:
-            table_buckets.extend(make_buckets(g, width_map, low_bit, sentinel_bit))
-        (indices, indexed) = index_buckets(table_buckets)
-        cp_groups = [ bucket.codepoints() for bucket in indexed]
-        output.append( (indices, offset_type) )
+    entry_groups = [ entries ]
+    for (low_bit, cap_bit, offset_type) in table_cfgs:
+        table = Table(entry_groups, low_bit, cap_bit, offset_type)
+        entry_groups = table.entry_groups()
+        output.append(table)
     return output
 
-def emit_module(
-        out_name: str, 
-        unicode_version: "tuple[int, int, int]",
-        data_nodes: "list[list[tuple[int, EffectiveWidth]]]",
-        search_nodes: "list[list[tuple[int, EffectiveWidth]]]", 
-        search_offsets: "list[int]"
-    ):
+def emit_module(out_name: str, unicode_version: "tuple[int, int, int]", tables):
     """ Outputs a Rust module to `out_name` with the following constants: 
-        - `KEYS_PER_NODE: usize`, same as this script's constant `KEYS_PER_NODE`. 
         - `UNICODE_VERSION: (u8, u8, u8)`, corresponds to `unicode_version`. 
-        - `DATA_NODES: [Node; ...]`, corresponds to `data_nodes`.
+        - `TABLE_{i}: [u8; ...]`, corresponds to `tables[i]` for all valid `i`
         - `SEARCH_NODES: [Node; ...]`, corresponds to `search_nodes`.
         - `SEARCH_OFFSETS: [usize; ...], corresponds to `search_offsets`. """
     if os.path.exists(out_name):
@@ -242,7 +256,6 @@ def emit_module(
 
 // NOTE: The following code was generated by "scripts/unicode.py", do not edit directly
 
-use search::Node;
 """)
         # Write the Unicode version & doc comment
         of.write("""
@@ -251,38 +264,8 @@ use search::Node;
 pub const UNICODE_VERSION: (u8, u8, u8) = (%s, %s, %s);
 """ % unicode_version)
 
-        # Write the keys per node
-        of.write("""
-/// (todo)
-pub const KEYS_PER_NODE: usize = %s;
-""" % KEYS_PER_NODE)
-
-        # Write the search layer offsets
-        of.write("""
-/// (todo)
-pub const SEARCH_OFFSETS: [usize; %s] = [""" % len(search_offsets))
-        for offset in search_offsets[:-1]:
-            of.write(f"{offset}, ")
-        of.write(f"{search_offsets[-1]}];\n")
-
-        # Write the search nodes
-        of.write("""
-/// (todo)
-pub const SEARCH_NODES: [Node; %s] = [""" % len(search_nodes))
-        for i, node in enumerate(search_nodes):
-            if i in offsets:
-                of.write('\n') # visually delimit the layers
-            of.write(f"\t{node_to_string(node)},\n")
-        of.write("];\n")
-
-        # Write the data nodes
-        of.write("""
-/// (todo)
-pub const DATA_NODES: [Node; %s] = [
-""" % len(data_nodes))
-        for node in data_nodes:
-            of.write(f"\t{node_to_string(node)},\n")
-        of.write("];\n")
+        # Write out tables
+        assert False
 
 if __name__ == "__main__":
     version = load_unicode_version()
@@ -303,13 +286,19 @@ if __name__ == "__main__":
         width_map[i] = EffectiveWidth.ZERO
 
     TABLE_CFGS = [
-        (OffsetType.U8, 13, NUM_CODEPOINT_BITS),
-        (OffsetType.U8, 6, 13),
-        (OffsetType.U2, 0, 6)
+        (13, NUM_CODEPOINT_BITS, OffsetType.U8),
+        (6, 13, OffsetType.U8),
+        (0, 6, OffsetType.U2)
     ]
 
-    tables = make_tables(TABLE_CFGS, range(0, len(width_map)), width_map)
-    for table in tables:
-        print(f"Table: {math.ceil(len(table[0]) * int(table[1]) / 8)} ")
-    
-    # emit_module("generated.rs", version, data_layer, flattened, offsets)
+    tables = make_tables(TABLE_CFGS, enumerate(width_map))
+
+    print("------------------------")
+    total_size = 0
+    for (i, table) in enumerate(tables):
+        total_size += table.size_bytes()
+        print(f"Table {i} Size: {table.size_bytes()} bytes")
+    print("------------------------")
+    print(f"  Total Size: {total_size} bytes")
+
+    emit_module("tables.rs", version, tables)
