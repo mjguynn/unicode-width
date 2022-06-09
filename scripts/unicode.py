@@ -23,9 +23,6 @@ import re, os, sys, enum, math
 NUM_CODEPOINTS = 0x110000
 """ An upper bound for which `range(0, NUM_CODEPOINTS)` contains Unicode's codespace. """
 
-NUM_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
-""" The maximum number of bits required to represent a Unicode codepoint. """
-
 Codepoint = int
 BitIndex = int
 
@@ -158,8 +155,7 @@ class Bucket:
         result.sort()
         return result
 
-def make_buckets(entries, low_bit: BitIndex, cap_bit: BitIndex) -> "list[Bucket]":
-    num_bits = cap_bit - low_bit
+def make_buckets(entries, low_bit: BitIndex, num_bits: BitIndex) -> "list[Bucket]":
     assert num_bits > 0
     buckets = [Bucket() for _ in range(0, 2**num_bits)]
     mask = (1 << num_bits) - 1
@@ -182,26 +178,27 @@ def index_buckets(buckets) -> "tuple[list[Codepoint], list[Bucket]]":
             indexed.append(bucket)
     return (indices, indexed)
 
-class OffsetType(enum.IntEnum):
-    """ Represents the data type of a lookup table's offsets. """
-    U2 = 2,
+class OffsetType(enum.Enum):
+    """ Represents the data type of a lookup table's offsets. The integer value assigned to each
+        variant represents the number of TODO"""
+    U2 = (2, 2)
     """ Offsets are 2-bit unsigned integers, packed four-per-byte. """
-    U4 = 4,
+    U4 = (4, 1)
     """ Offsets are 4-bit unsigned integers, packed two-per-byte. """
-    U8 = 8
+    U8 = (8, 0)
     """ Each offset is a single byte (u8). """
 
 class Table:
     def __init__(self, entry_groups, low_bit: BitIndex, cap_bit: BitIndex, offset_type: OffsetType):
         self.low_bit = low_bit
-        self.cap_bit = cap_bit
+        self.num_bits = cap_bit - low_bit
         self.offset_type = offset_type
         self.indices = []
         self.indexed = []
 
         buckets = []
         for entries in entry_groups:
-            buckets.extend(make_buckets(entries, low_bit, cap_bit))
+            buckets.extend(make_buckets(entries, self.low_bit, self.num_bits))
 
         # Index buckets
         for bucket in buckets:
@@ -215,35 +212,46 @@ class Table:
 
         # Validate offset type -- then set it upon success
         for index in self.indices:
-            assert index < (1 << int(self.offset_type))
+            assert index < (1 << self.offset_type.value[0])
 
-    def entry_groups(self):
-        return map(lambda bucket: bucket.entries(), self.indexed)
+    def buckets(self):
+        return self.indexed
         
-    def size_bytes(self) -> int:
-        """ Returns the size of this table's data in bytes. Doesn't account for padding. """
-        return len(self.indices) * int(self.offset_type) // 8
+    def indexing_info(self):
+        byte_bits = self.offset_type.value[1]
+        byte_info = None
+        if byte_bits != 0:
+            emask = (1 << self.offset_type.value[1]) - 1
+            byte_info = (self.low_bit, (1 << byte_bits) - 1, self.offset_type.value[0], emask)
+        return (self.low_bit + byte_bits, (1 << (self.num_bits - byte_bits)) - 1, byte_info)
+
+    def byte_array(self) -> "list[int]":
+        indices_per_byte = 8 // self.offset_type.value[0]
+        byte_array = []
+        for i in range(0,len(self.indices),indices_per_byte):
+            byte = 0
+            for j in range(0,indices_per_byte):
+                byte |= self.indices[i+j] << (j*self.offset_type.value[0])
+            byte_array.append(byte)
+        return byte_array
+
         
 def make_tables(table_cfgs: "list[tuple[BitIndex, BitIndex, OffsetType]]", entries) -> "list[Table]":
     output = []
     entry_groups = [ entries ]
     for (low_bit, cap_bit, offset_type) in table_cfgs:
         table = Table(entry_groups, low_bit, cap_bit, offset_type)
-        entry_groups = table.entry_groups()
+        entry_groups = map(lambda bucket: bucket.entries(), table.buckets())
         output.append(table)
     return output
 
 def emit_module(out_name: str, unicode_version: "tuple[int, int, int]", tables):
     """ Outputs a Rust module to `out_name` with the following constants: 
         - `UNICODE_VERSION: (u8, u8, u8)`, corresponds to `unicode_version`. 
-        - `TABLE_{i}: [u8; ...]`, corresponds to `tables[i]` for all valid `i`
-        - `SEARCH_NODES: [Node; ...]`, corresponds to `search_nodes`.
-        - `SEARCH_OFFSETS: [usize; ...], corresponds to `search_offsets`. """
+        - `TABLE_{i}: [u8; ...]`, corresponds to `tables[i]` for all valid `i` """
     if os.path.exists(out_name):
         os.remove(out_name)
-    print(f"Outputting module to \"{out_name}\"")
     with open(out_name, "w") as of:
-        # Write the file's preamble
         of.write("""// Copyright 2012-2022 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
 // http://rust-lang.org/COPYRIGHT.
@@ -255,18 +263,87 @@ def emit_module(out_name: str, unicode_version: "tuple[int, int, int]", tables):
 // except according to those terms.
 
 // NOTE: The following code was generated by "scripts/unicode.py", do not edit directly
-
 """)
-        # Write the Unicode version & doc comment
         of.write("""
 /// The version of [Unicode](http://www.unicode.org/)
 /// that this version of unicode-width is based on.
 pub const UNICODE_VERSION: (u8, u8, u8) = (%s, %s, %s);
 """ % unicode_version)
 
-        # Write out tables
-        assert False
+        of.write("""
+pub mod charwidth {
+    use core::option::Option::{self, None, Some};
 
+    #[inline]
+    fn lookup_width(c: char, is_cjk: bool) -> usize {
+        let cp = c as usize;
+
+""")
+
+        mul_var = 1
+        index_var = 0
+        for (i, table) in enumerate(tables):
+            (lrs, mask, byte_indexing_info) = table.indexing_info()
+            table_index = f"{mul_var} * ({index_var} as usize) + ( cp >> {lrs} & 0x{mask:0X} )"
+            byte_index = ""
+            if byte_indexing_info:
+                (blrs, bmask, bmul, emask) = byte_indexing_info
+                byte_index = f" >> ({bmul} * (cp >> {blrs} & 0x{bmask:0X})) & 0x{emask:0X}"
+            of.write(f"\t\tlet i{i} = TABLE_{i}[{table_index}]{byte_index};\n")
+            mul_var = len(table.buckets())
+            index_var = f"i{i}"
+
+        of.write("""
+        if %s == 3 {
+            if is_cjk { 
+                2 
+            } else { 
+                1 
+            }
+        } else {
+            %s.into()
+        }
+    }
+    """ % (index_var, index_var))
+
+        of.write("""
+    #[inline(always)]
+    pub fn width(c: char, is_cjk: bool) -> Option<usize> {
+        if c < '\\u{7F}' {
+            if c >= '\\u{20}' {
+                // U+0020 to U+007F (exclusive) are single-width ASCII
+                Some(1)
+            } else if c == '\\0' {
+                // U+0000 *is* a control code, but it's special-cased
+                Some(0)
+            } else {
+                // U+0001 to U+0020 (exclusive) are control codes
+                None
+            }
+        } else if c >= '\\u{A0}' {
+            Some(lookup_width(c, is_cjk))
+        } else {
+            // U+007F to U+00A0 (exclusive) are control codes
+            None
+        }
+    }
+    """)
+
+        for (i, table) in enumerate(tables):
+            byte_array = table.byte_array()
+            of.write("""
+    /// (todo)
+    const TABLE_%s: [u8; %s] = [""" % (i, len(byte_array)))
+            for (j, byte) in enumerate(byte_array):
+                if j % 12 == 0:
+                    of.write("\n\t\t")
+                of.write(f"0x{byte:02X}, ")
+            of.write("\n\t];\n")
+        of.write("""
+}
+""")
+        
+            
 if __name__ == "__main__":
     version = load_unicode_version()
     print("Generating module for Unicode %s.%s.%s" % version)
@@ -285,20 +362,22 @@ if __name__ == "__main__":
     for i in range(0x1160, 0x11FF + 1):
         width_map[i] = EffectiveWidth.ZERO
 
+    MAX_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
     TABLE_CFGS = [
-        (13, NUM_CODEPOINT_BITS, OffsetType.U8),
+        (13, MAX_CODEPOINT_BITS, OffsetType.U8),
         (6, 13, OffsetType.U8),
         (0, 6, OffsetType.U2)
     ]
-
     tables = make_tables(TABLE_CFGS, enumerate(width_map))
 
     print("------------------------")
     total_size = 0
     for (i, table) in enumerate(tables):
-        total_size += table.size_bytes()
-        print(f"Table {i} Size: {table.size_bytes()} bytes")
+        size_bytes = len(table.byte_array())
+        print(f"Table {i} Size: {size_bytes} bytes")
+        total_size += size_bytes
     print("------------------------")
     print(f"  Total Size: {total_size} bytes")
 
-    emit_module("tables.rs", version, tables)
+    OUT_NAME = "tables.rs"
+    emit_module(OUT_NAME, version, tables)
