@@ -56,12 +56,12 @@ extern crate std;
 #[cfg(feature = "bench")]
 extern crate test;
 
-pub use generated::UNICODE_VERSION;
+use tables::charwidth as cw;
+pub use tables::UNICODE_VERSION;
 
 use core::ops::Add;
 
-mod search;
-mod generated;
+mod tables;
 
 #[cfg(test)]
 mod tests;
@@ -87,33 +87,12 @@ pub trait UnicodeWidthChar {
     fn width_cjk(self) -> Option<usize>;
 }
 
-fn char_width(codepoint: char, is_cjk: bool) -> Option<usize>{
-    if codepoint < '\u{7F}' {
-        if codepoint > '\u{1F}' {
-            Some(1)
-        } else if codepoint == '\0' {
-            Some(0)
-        } else {
-            None
-        }
-    } else if codepoint >= '\u{A0}' {
-        Some(search::lookup_width(codepoint, is_cjk))
-    }
-    else {
-        None
-    }
-}
-
 impl UnicodeWidthChar for char {
     #[inline]
-    fn width(self) -> Option<usize> { 
-        char_width(self, false)
-    }
+    fn width(self) -> Option<usize> { cw::width(self, false) }
 
     #[inline]
-    fn width_cjk(self) -> Option<usize> { 
-        char_width(self, true)
-    }
+    fn width_cjk(self) -> Option<usize> { cw::width(self, true) }
 }
 
 /// Methods for determining displayed width of Unicode strings.
@@ -142,11 +121,11 @@ pub trait UnicodeWidthStr {
 impl UnicodeWidthStr for str {
     #[inline]
     fn width(&self) -> usize {
-        self.chars().map(|c| c.width().unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| cw::width(c, false).unwrap_or(0)).fold(0, Add::add)
     }
 
     #[inline]
     fn width_cjk(&self) -> usize {
-        self.chars().map(|c| c.width_cjk().unwrap_or(0)).fold(0, Add::add)
+        self.chars().map(|c| cw::width(c, true).unwrap_or(0)).fold(0, Add::add)
     }
 }
