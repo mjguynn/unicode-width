@@ -56,34 +56,34 @@ codepoint and those tables offsets are stored according to `offset_type`.
 If this is edited, you must ensure that `emit_module` reflects your changes."""
 
 MODULE_FILENAME = "tables.rs"
-"""The filename of the output Rust module (will be created in the working directory)"""
+"""The filename of the emitted Rust module (will be created in the working directory)"""
 
 Codepoint = int
 BitPos = int
 
 
-def fetch_open(name: str):
-    """Opens `name` and return its corresponding file object. If `name` isn't present on disk,
+def fetch_open(filename: str):
+    """Opens `filename` and return its corresponding file object. If `filename` isn't on disk,
     fetches it from `http://www.unicode.org/Public/UNIDATA/`. Exits with code 1 on failure."""
-    if not os.path.exists(os.path.basename(name)):
-        os.system(f"curl -O http://www.unicode.org/Public/UNIDATA/{name}")
+    if not os.path.exists(os.path.basename(filename)):
+        os.system(f"curl -O http://www.unicode.org/Public/UNIDATA/{filename}")
     try:
-        return open(name, encoding="utf-8")
+        return open(filename, encoding="utf-8")
     except OSError:
-        sys.stderr.write(f"cannot load {name}")
+        sys.stderr.write(f"cannot load {filename}")
         sys.exit(1)
 
 
 def load_unicode_version() -> "tuple[int, int, int]":
-    """Returns the current Unicode version by fetching and parsing `ReadMe.txt`."""
+    """Returns the current Unicode version by fetching and processing `ReadMe.txt`."""
     with fetch_open("ReadMe.txt") as readme:
         pattern = r"for Version (\d+)\.(\d+)\.(\d+) of the Unicode"
         return tuple(map(int, re.search(pattern, readme.read()).groups()))
 
 
 class EffectiveWidth(enum.IntEnum):
-    """For our purposes, we only care about the following character widths.
-    All East Asian Width classes resolve into either `NARROW`, `WIDE`, or `AMBIGUOUS`."""
+    """Represents the width of a Unicode character. All East Asian Width classes resolve into
+    either `EffectiveWidth.NARROW`, `EffectiveWidth.WIDE`, or `EffectiveWidth.AMBIGUOUS`."""
 
     ZERO = 0
     """ Zero columns wide. """
@@ -147,7 +147,7 @@ def load_east_asian_widths() -> "list[EffectiveWidth]":
 def load_zero_widths() -> "list[bool]":
     """Returns a list `l` where `l[c]` is true if codepoint `c` is considered a zero-width
     character. `c` is considered a zero-width character if `c` is in general categories
-    `Cc`, `Cf`, `Mn`, or `Me` (determined by fetching and parsing `UnicodeData.txt`)."""
+    `Cc`, `Cf`, `Mn`, or `Me` (determined by fetching and processing `UnicodeData.txt`)."""
     with fetch_open("UnicodeData.txt") as categories:
         zw_map = []
         current = 0
@@ -207,14 +207,14 @@ class Bucket:
         return True
 
     def entries(self) -> "list[tuple[Codepoint, EffectiveWidth]]":
-        """Return a sorted list of the codepoint/width pairs in this bucket."""
+        """Return a list of the codepoint/width pairs in this bucket, sorted by codepoint."""
         result = list(self.entry_set)
         result.sort()
         return result
 
     def width(self) -> "EffectiveWidth":
-        """If all codepoints in this bucket have the same width, return that width;
-        otherwise, return `None`."""
+        """If all codepoints in this bucket have the same width, return that width; otherwise,
+        return `None`."""
         if len(self.widths) == 0:
             return None
         potential_width = self.widths[0]
@@ -240,16 +240,16 @@ def make_buckets(entries, low_bit: BitPos, cap_bit: BitPos) -> "list[Bucket]":
 class Table:
     """Represents a lookup table. Each table contains a certain number of subtables; each
     subtable is indexed by a contiguous bit range of the codepoint and contains a list
-    of `2**(number of bits in bit range)` entries.
+    of `2**(number of bits in bit range)` entries. (The bit range is the same for all subtables.)
 
     Typically, tables contain a list of buckets of codepoints. Bucket `i`'s codepoints should
-    be indexed by sub-table `i` in the following lookup table. The entries of this table are
-    indexes into the bucket list (~= indexes into the sub-tables of the following table.) The
+    be indexed by sub-table `i` in the next-level lookup table. The entries of this table are
+    indexes into the bucket list (~= indexes into the sub-tables of the next-level table.) The
     key to compression is that two different buckets in two different sub-tables may have the
     same width list, which means that they can be merged into the same bucket.
 
-    If every bucket's codepoints have uniform width, calling `indices_to_widths` will discard
-    the buckets and convert the entries into `EffectiveWidth` values."""
+    If no bucket contains two codepoints with different widths, calling `indices_to_widths` will
+    discard the buckets and convert the entries into `EffectiveWidth` values."""
 
     def __init__(
         self, entry_groups, low_bit: BitPos, cap_bit: BitPos, offset_type: OffsetType
@@ -283,7 +283,7 @@ class Table:
 
     def indices_to_widths(self):
         """Destructively converts the indices in this table to the `EffectiveWidth` values of
-        their buckets. Assumes that no bucket includes codepoints with different widths."""
+        their buckets. Assumes that no bucket contains codepoints with different widths."""
         self.entries = list(map(lambda i: int(self.indexed[i].width()), self.entries))
         del self.indexed
 
@@ -293,8 +293,9 @@ class Table:
 
     def to_bytes(self) -> "list[int]":
         """Returns this table's entries as a list of bytes. The bytes are formatted according to
-        the `OffsetType` which the table was created with. For example, with `OffsetType.U2`,
-        each byte will contain four packed 2-bit entries."""
+        the `OffsetType` which the table was created with, converting any `EffectiveWidth` entries
+        to their enum variant's integer value. For example, with `OffsetType.U2`, each byte will
+        contain four packed 2-bit entries."""
         entries_per_byte = 8 // int(self.offset_type)
         byte_array = []
         for i in range(0, len(self.entries), entries_per_byte):
@@ -324,7 +325,7 @@ def make_tables(
 def emit_module(
     out_name: str, unicode_version: "tuple[int, int, int]", tables: "list[Table]"
 ):
-    """Outputs the `tables.rs` Rust module to `out_name` using table data from `tables`.
+    """Outputs a Rust module to `out_name` using table data from `tables`.
     If `TABLE_CFGS` is edited, you may need to edit the included code for `lookup_width`."""
     if os.path.exists(out_name):
         os.remove(out_name)
